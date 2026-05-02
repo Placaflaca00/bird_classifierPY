@@ -1,0 +1,18 @@
+# Placeholder workflow.
+#
+# Purpose: weekly cron that runs scripts/cleanup_wandb.py to delete old W&B
+# runs (e.g. crashed/non-tagged runs older than N days) so the project doesn't
+# bloat past the free-tier storage cap.
+name: cleanup_wandb
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"  # Sundays at 03:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: TODO
+        run: echo "W&B cleanup not implemented yet"

@@ -1,0 +1,5 @@
+# Frontend dependencies for the HuggingFace Space.
+# Kept minimal — the heavy lifting (BirdNET + ONNX) lives in the Lambda backend.
+
+gradio
+requests

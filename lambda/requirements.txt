@@ -1,0 +1,9 @@
+# Runtime dependencies for the AWS Lambda inference image.
+# Keep this list MINIMAL — every MB increases cold-start time.
+# Pinning is intentionally loose at the scaffolding stage; tighten before deploy.
+
+tflite-runtime
+onnxruntime
+librosa
+numpy
+soundfile

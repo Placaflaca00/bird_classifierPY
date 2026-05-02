@@ -1,0 +1,25 @@
+# Placeholder workflow.
+#
+# Purpose: build the Lambda Docker image, push to ECR, and update the Lambda
+# function on every release tag (v*.*.*).
+#
+# Steps (TODO):
+#   1. Configure AWS credentials (OIDC, no long-lived keys).
+#   2. Login to ECR.
+#   3. Build image from lambda/Dockerfile.
+#   4. Tag and push to ${ECR_REPOSITORY}.
+#   5. aws lambda update-function-code --image-uri ...
+#   6. Deploy the Gradio app/ to HuggingFace Spaces (separate job).
+name: deploy
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+jobs:
+  deploy-lambda:
+    runs-on: ubuntu-latest
+    steps:
+      - name: TODO
+        run: echo "Lambda deploy not implemented yet"

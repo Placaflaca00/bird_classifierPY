@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python *)",
+      "Bash(where ruff *)",
+      "Bash(ruff --version)",
+      "Bash(.venv/Scripts/python.exe -m pip install --quiet --upgrade pip ruff)",
+      "Bash(.venv/Scripts/ruff.exe *)",
+      "Bash(command -v tree)"
+    ]
+  }
+}

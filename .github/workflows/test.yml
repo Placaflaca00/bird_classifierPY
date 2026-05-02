@@ -1,0 +1,22 @@
+# Placeholder workflow.
+#
+# Purpose: run lint (ruff) + unit tests (pytest) on every push and PR to main.
+# Will install the package with `pip install -e ".[dev]"` and execute:
+#   - pre-commit run --all-files
+#   - pytest tests/
+#
+# TODO: implement actual job steps once tests exist.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: TODO
+        run: echo "Lint + tests not implemented yet"
