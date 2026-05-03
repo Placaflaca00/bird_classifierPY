@@ -171,7 +171,13 @@ data/test_sets/*
 !data/test_sets/.gitkeep
 !data/README.md
 
+# Sidecar files que sí se ignoran
+data/raw/.failed_urls.txt
+
 # Local secrets / scratch
 *.local
 scratch/
 tmp/
+
+
+.claude/*

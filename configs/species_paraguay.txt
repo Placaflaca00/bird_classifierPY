@@ -1,0 +1,34 @@
+# Lista de especies de Paraguay (fuente: Resumen Ejecutivo PDF, 23 especies).
+# Una especie por línea, nombre científico exacto.
+# Líneas que empiezan con # se ignoran.
+#
+# Formato:  Genus species   # nombre_común | estatus
+
+# --- Nativas terrestres / acuáticas ---
+Rhea americana          # Ñandú | Nativa NT
+Eudromia formosa        # Martineta chaqueña | Nativa
+Chauna torquata         # Chajá | Nativa
+Heliornis fulica        # Ipequí (sungrebe) | Nativa
+Ortalis canicollis      # Charata (chachalaca del Chaco) | Nativa
+Pipile jacutinga        # Yacutinga | Nativa
+Ramphastos toco         # Tucán toco | Nativa
+Phoenicopterus chilensis # Flamenco austral | Nativa
+Mycteria americana      # Tuyuyú (cigüeña americana) | Nativa
+Jabiru mycteria         # Yabirú | Nativa
+Ara ararauna            # Guacamayo azulamarillo | Nativa
+
+# --- Migratorias (playeros y chorlos) ---
+Pluvialis squatarola    # Chorlo Ártico (Playero gris) | Migratoria
+Pluvialis dominica      # Chorlo Pampa (Playero dorado) | Migratoria
+Calidris pusilla        # Playerito Enano | Migratoria
+Calidris minutilla      # Playerito Menor | Migratoria
+Tringa flavipes         # Pitotoy Chico | Migratoria
+Tringa melanoleuca      # Pitotoy Grande | Migratoria
+Actitis macularius      # Pitotoy Solitario | Migratoria
+Calidris melanotos      # Playerito Pectoral | Migratoria
+Calidris bairdii        # Playerito de Baird | Migratoria
+Calidris fuscicollis    # Playerito Rabadilla Blanca | Migratoria
+Calidris canutus        # Playero Rojizo | Migratoria
+
+# --- Introducida (omitir si querés solo nativas) ---
+Columba livia           # Paloma doméstica | Introducida

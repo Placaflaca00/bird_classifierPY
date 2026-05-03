@@ -6,7 +6,32 @@
       "Bash(ruff --version)",
       "Bash(.venv/Scripts/python.exe -m pip install --quiet --upgrade pip ruff)",
       "Bash(.venv/Scripts/ruff.exe *)",
-      "Bash(command -v tree)"
+      "Bash(command -v tree)",
+      "Bash(.venv/Scripts/python.exe -m pip install --quiet -e \".[data]\")",
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(file data/raw/rhea_americana/*.mp3)",
+      "Bash(dir C:\\\\Users\\\\moha2\\\\Documents\\\\birdClassifier\\\\data\\\\raw *)",
+      "Bash(dir \"C:\\\\Users\\\\moha2\\\\Documents\\\\birdClassifier\\\\data\\\\raw\\\\actitis_macularius\")",
+      "Bash(Select-Object -First 20)",
+      "Bash(where ffprobe *)",
+      "Bash(where ffmpeg *)",
+      "Bash(awk -F= '{print $1\": \"\\(length\\($2\\)>0?\"set\":\"EMPTY\"\\)}')",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_metadata.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_metadata.py --apply)",
+      "Bash(awk -F= '{ *)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_data_to_wandb.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/download_xc_test_hard.py --survey)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/download_xc_test_hard.py --download)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_test_hard_to_wandb.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_test_hard_to_wandb.py --upload)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/precompute_embeddings.py --limit 20)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/precompute_embeddings.py --resume)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_embeddings_to_wandb.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_embeddings_to_wandb.py --upload)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_splits.py)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_splits.py --apply)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_splits_to_wandb.py --upload)",
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m src.training.train)"
     ]
   }
 }
