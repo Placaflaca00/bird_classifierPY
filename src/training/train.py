@@ -16,6 +16,7 @@ Pipeline:
     5. trainer.fit().
     6. trainer.test() sobre val + test_clean + test_hard, reportar a W&B summary.
 """
+
 from __future__ import annotations
 
 import os
@@ -45,6 +46,7 @@ DEFAULTS: dict[str, Any] = {
     "weight_decay": 1e-4,
     "dropout": 0.3,
     "hidden_dims": (256, 128),
+    "mixup_alpha": 0.0,
     "early_stopping_patience": 8,
     "seed": 42,
     "run_name": "baseline-v0",
@@ -64,10 +66,12 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     num_classes = len(species_to_idx)
 
     loaders = build_dataloaders(batch_size=cfg["batch_size"])
-    print(f"Sizes: train={len(loaders['train'].dataset)} "
-          f"val={len(loaders['val'].dataset)} "
-          f"test_clean={len(loaders['test_clean'].dataset)} "
-          f"test_hard={len(loaders['test_hard'].dataset)}")
+    print(
+        f"Sizes: train={len(loaders['train'].dataset)} "
+        f"val={len(loaders['val'].dataset)} "
+        f"test_clean={len(loaders['test_clean'].dataset)} "
+        f"test_hard={len(loaders['test_hard'].dataset)}"
+    )
     print(f"num_classes: {num_classes}")
 
     model = BirdClassifier(
@@ -77,6 +81,7 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         dropout=cfg["dropout"],
         lr=cfg["lr"],
         weight_decay=cfg["weight_decay"],
+        mixup_alpha=cfg["mixup_alpha"],
     )
 
     logger = WandbLogger(
@@ -141,9 +146,11 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
             verbose=False,
         )
         final_results[fold] = {k: float(v) for k, v in out[0].items()}
-        print(f"  {fold:<11} loss={final_results[fold]['test_loss']:.4f}  "
-              f"acc={final_results[fold]['test_acc']:.4f}  "
-              f"macro_f1={final_results[fold]['test_macro_f1']:.4f}")
+        print(
+            f"  {fold:<11} loss={final_results[fold]['test_loss']:.4f}  "
+            f"acc={final_results[fold]['test_acc']:.4f}  "
+            f"macro_f1={final_results[fold]['test_macro_f1']:.4f}"
+        )
 
     # Resumen en W&B summary (con prefijo claro)
     for fold, metrics in final_results.items():

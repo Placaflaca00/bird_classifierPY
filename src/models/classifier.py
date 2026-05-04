@@ -10,10 +10,14 @@ Decisiones:
 - CrossEntropyLoss directo sobre logits.
 - Métricas: Accuracy y MacroF1 (torchmetrics) — macro-F1 es la métrica primaria
   porque el dataset está desbalanceado.
+- Mixup opcional sobre embeddings (Zhang et al. 2018): si ``mixup_alpha > 0``,
+  se mezclan pares de embeddings dentro del batch via permutación.
 """
+
 from __future__ import annotations
 
 import lightning as L
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,6 +33,7 @@ class BirdClassifier(L.LightningModule):
         dropout: float = 0.3,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
+        mixup_alpha: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -55,9 +60,19 @@ class BirdClassifier(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        logits = self(x)
-        loss = F.cross_entropy(logits, y)
-        self.train_acc(logits, y)
+        alpha = self.hparams.mixup_alpha
+        if alpha > 0.0 and x.size(0) > 1:
+            lam = float(np.random.beta(alpha, alpha))
+            perm = torch.randperm(x.size(0), device=x.device)
+            x_mix = lam * x + (1.0 - lam) * x[perm]
+            logits = self(x_mix)
+            loss = lam * F.cross_entropy(logits, y) + (1.0 - lam) * F.cross_entropy(logits, y[perm])
+            # train_acc se mide contra y "original" (informativo, no exacto bajo mixup)
+            self.train_acc(logits, y)
+        else:
+            logits = self(x)
+            loss = F.cross_entropy(logits, y)
+            self.train_acc(logits, y)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)
         return loss
@@ -90,9 +105,7 @@ class BirdClassifier(L.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="min", factor=0.5, patience=3
-        )
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
         return {
             "optimizer": opt,
             "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"},

@@ -35,8 +35,8 @@ Credentials (W&B, AWS, HF) live in `.env` (copy from `.env.example`). When the u
 
 Two-stage classifier:
 
-1. **Feature extractor** — BirdNET TFLite produces a 320-dim embedding per audio clip. Frozen, not trained. Used both offline (training-time embedding pre-computation) and online (Lambda inference).
-2. **Classification head** — MLP `320 → 256 → 128 → num_classes` as `pl.LightningModule` trained on pre-computed embeddings. Exported to ONNX for production.
+1. **Feature extractor** — BirdNET V2.4 TFLite produces a **1024-dim** embedding per audio clip (penúltima capa, leída con `experimental_preserve_all_tensors=True` y `embedding_idx = classifier_out_idx - 1`; ver `scripts/precompute_embeddings.py`). Frozen, not trained. Used both offline (training-time embedding pre-computation) and online (Lambda inference). Nota: docs viejos de BirdNET (V1.x / V2.1) mencionan 320 — **no aplica a V2.4**.
+2. **Classification head** — MLP `1024 → 256 → 128 → num_classes` as `pl.LightningModule` trained on pre-computed embeddings. Exported to ONNX for production.
 
 Data flow:
 
