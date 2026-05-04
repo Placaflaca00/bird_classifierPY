@@ -31,7 +31,14 @@
       "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_splits.py)",
       "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/build_splits.py --apply)",
       "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/upload_splits_to_wandb.py --upload)",
-      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m src.training.train)"
+      "Bash(PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m src.training.train)",
+      "Bash(tasklist)",
+      "Bash(tasklist /v)",
+      "Bash(tasklist /fi \"PID eq 14680\")",
+      "Bash(tasklist /v /fo csv)",
+      "PowerShell(Get-Process *)",
+      "PowerShell(Stop-Process *)",
+      "Bash(grep *)"
     ]
   }
 }

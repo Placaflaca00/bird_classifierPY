@@ -31,6 +31,8 @@ python scripts/build_metadata.py --apply         # write data/raw/metadata.parqu
 
 Credentials (W&B, AWS, HF) live in `.env` (copy from `.env.example`). When the user needs to add a token, **direct them to paste into `.env` directly — never into chat**. The user has a documented habit of pasting credentials in chat; flag aggressively.
 
+**W&B project name (case-sensitive): `bird-classifierPy`** (con `P` mayúscula al final, NO `bird-classifier-py`). Aplica a `WANDB_PROJECT` env var, URLs `wandb.ai/<entity>/bird-classifierPy`, `use_artifact()`, `wandb.init(project=...)`. Los `HF_SPACE_NAME`, `ECR_REPOSITORY`, `LAMBDA_FUNCTION_NAME` en `.env.example` son nombres de OTROS servicios (no W&B) y pueden tener su propia convención.
+
 ## Architecture (big picture)
 
 Two-stage classifier:

@@ -51,6 +51,10 @@ DEFAULTS: dict[str, Any] = {
     "seed": 42,
     "run_name": "baseline-v0",
     "tags": ["baseline", "no-augmentation"],
+    # Refs a artifacts de input (lineage). Override desde el notebook para
+    # apuntar a versiones aumentadas u otras splits.
+    "embeddings_artifact": "embeddings:v0",
+    "splits_artifact": "splits:v0",
 }
 
 
@@ -94,8 +98,8 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         save_dir=str(ROOT / "wandb"),
     )
     # Lineage: declarar inputs ANTES de fit
-    logger.experiment.use_artifact("embeddings:v0")
-    logger.experiment.use_artifact("splits:v0")
+    logger.experiment.use_artifact(cfg["embeddings_artifact"])
+    logger.experiment.use_artifact(cfg["splits_artifact"])
 
     ckpt_dir = ROOT / "checkpoints" / cfg["run_name"]
     ckpt_dir.mkdir(parents=True, exist_ok=True)

@@ -2,24 +2,32 @@
 
 Pipeline por archivo:
     1. Cargar audio mono a 48 kHz (librosa).
-    2. Trocear en ventanas de 3 s (144000 samples). La última se padea con ceros.
-    3. Pasar cada ventana por BirdNET TFLite -> tensor index 545 (penúltima capa).
-    4. Mean-pool sobre todas las ventanas -> 1 vector 1024-dim por audio.
+    2. (Opcional) Aplicar pipeline de audiomentations sobre el waveform completo
+       para generar K copias aumentadas (sólo split=train).
+    3. Trocear en ventanas de 3 s (144000 samples). La última se padea con ceros.
+    4. Pasar cada ventana por BirdNET TFLite -> tensor index 545 (penúltima capa).
+    5. Mean-pool sobre todas las ventanas -> 1 vector 1024-dim por (audio, aug_id).
 
 Procesa en una sola pasada los splits 'train' (data/raw/) y 'test_hard'
 (data/test_sets/xc_hard/), pero los marca con la columna `split` para que
-el training NUNCA agarre test_hard.
+el training NUNCA agarre test_hard. test_hard nunca se aumenta.
 
 Salida: data/processed/embeddings.parquet con columnas:
-    filepath, species, split, embedding (lista de 1024 floats)
+    filepath, species, split, embedding, is_aug, aug_id
+
+Cada audio aparece K+1 veces si está en train y --augment=K (aug_id=0 es el
+original; 1..K son copias aumentadas). En test_hard aparece 1 vez (aug_id=0).
 
 Uso:
-    python scripts/precompute_embeddings.py             # full
-    python scripts/precompute_embeddings.py --limit 20  # smoke test (20 audios)
+    python scripts/precompute_embeddings.py                       # full, sin aug
+    python scripts/precompute_embeddings.py --limit 20            # smoke test
+    python scripts/precompute_embeddings.py --augment 2           # K=2 sobre train
+    python scripts/precompute_embeddings.py --augment 2 --resume  # retomar parcial
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -33,6 +41,10 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.data.augmentations import build_audio_pipeline  # noqa: E402
+
 RAW_DIR = ROOT / "data" / "raw"
 TEST_DIR = ROOT / "data" / "test_sets" / "xc_hard"
 OUT_DIR = ROOT / "data" / "processed"
@@ -73,15 +85,19 @@ def chunk_audio(y: np.ndarray) -> np.ndarray:
     return y[: n_windows * WINDOW_SAMPLES].reshape(n_windows, WINDOW_SAMPLES)
 
 
-def embed_audio(audio_path: Path, interpreter, input_idx, emb_idx) -> np.ndarray:
-    """Devuelve un vector 1024-dim mean-pooleado sobre las ventanas."""
+def load_waveform(audio_path: Path) -> np.ndarray:
+    """Carga mono 48 kHz, float32. Levanta ValueError si está vacío."""
     import librosa
 
     y, _ = librosa.load(str(audio_path), sr=SAMPLE_RATE, mono=True)
     if len(y) == 0:
         raise ValueError(f"audio vacío: {audio_path}")
-    windows = chunk_audio(y).astype(np.float32)
+    return y.astype(np.float32)
 
+
+def embed_waveform(y: np.ndarray, interpreter, input_idx, emb_idx) -> np.ndarray:
+    """Mean-pool de embeddings BirdNET sobre las ventanas de un waveform."""
+    windows = chunk_audio(y).astype(np.float32)
     embs = np.empty((len(windows), EMBEDDING_DIM), dtype=np.float32)
     for k, w in enumerate(windows):
         interpreter.set_tensor(input_idx, np.expand_dims(w, axis=0))
@@ -95,7 +111,6 @@ def collect_jobs() -> pd.DataFrame:
     raw = pd.read_parquet(RAW_DIR / "metadata.parquet").assign(split="train")
     test = pd.read_parquet(TEST_DIR / "metadata.parquet").assign(split="test_hard")
 
-    # filepath en raw es relativo a data/raw/, en test_hard relativo a data/test_sets/xc_hard/
     raw["abs_path"] = raw["filepath"].apply(lambda p: str(RAW_DIR / p))
     test["abs_path"] = test["filepath"].apply(lambda p: str(TEST_DIR / p))
 
@@ -103,58 +118,109 @@ def collect_jobs() -> pd.DataFrame:
     return pd.concat([raw[cols], test[cols]], ignore_index=True)
 
 
+def aug_seed(base_seed: int, filepath: str, aug_id: int) -> int:
+    """Seed determinístico por (filepath, aug_id). Estable entre runs (md5)."""
+    fp_hash = int.from_bytes(hashlib.md5(filepath.encode("utf-8")).digest()[:4], "big")
+    return (base_seed * 1_000_003 + fp_hash * 17 + aug_id) & 0x7FFFFFFF
+
+
+def load_done_keys(parquet_path: Path) -> set[tuple[str, int]]:
+    """Lee parquet existente y devuelve set de (filepath, aug_id) ya hechos."""
+    df = pd.read_parquet(parquet_path)
+    if "aug_id" not in df.columns:
+        df["aug_id"] = 0
+    return set(zip(df["filepath"], df["aug_id"].astype(int)))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--limit", type=int, default=None,
-                        help="Procesar solo N audios (smoke test)")
+                        help="Procesar solo N audios (smoke test).")
     parser.add_argument("--resume", action="store_true",
-                        help="Saltear filepaths que ya están en embeddings.parquet")
+                        help="Saltear (filepath, aug_id) ya presentes en el parquet.")
+    parser.add_argument("--augment", type=int, default=0,
+                        help="K copias aumentadas por audio del split=train (0 = sin augmentation).")
+    parser.add_argument("--augment-seed", type=int, default=42,
+                        help="Base seed para aumentaciones (reproducibilidad).")
     args = parser.parse_args()
+
+    if args.augment < 0:
+        print("--augment debe ser >= 0", file=sys.stderr)
+        return 2
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     jobs = collect_jobs()
     if args.limit:
         jobs = jobs.head(args.limit).copy()
+
+    n_train = int((jobs["split"] == "train").sum())
+    n_test = int((jobs["split"] == "test_hard").sum())
+    rows_target = n_train * (args.augment + 1) + n_test
     print(f"Audios a procesar: {len(jobs)}")
-    print(f"  train:     {(jobs['split']=='train').sum()}")
-    print(f"  test_hard: {(jobs['split']=='test_hard').sum()}")
+    print(f"  train:     {n_train}  (augment K={args.augment} -> {n_train * (args.augment + 1)} embeddings)")
+    print(f"  test_hard: {n_test}")
+    print(f"Embeddings totales esperados: {rows_target}")
 
+    done_keys: set[tuple[str, int]] = set()
     if args.resume and OUT_PARQUET.exists():
-        done = set(pd.read_parquet(OUT_PARQUET)["filepath"])
-        before = len(jobs)
-        jobs = jobs[~jobs["filepath"].isin(done)].copy()
-        print(f"Resume: ya hechos {before - len(jobs)}, faltan {len(jobs)}")
+        done_keys = load_done_keys(OUT_PARQUET)
+        print(f"Resume: {len(done_keys)} (filepath, aug_id) ya en parquet.")
 
-    if jobs.empty:
-        print("Nada que procesar.")
-        return 0
+    aug_pipe = build_audio_pipeline() if args.augment > 0 else None
 
     print("\nCargando BirdNET TFLite...")
     interpreter, input_idx, emb_idx = build_interpreter()
     print("OK.\n")
 
-    rows = []
+    rows: list[dict] = []
+    skipped_audios = 0
+    failures = 0
     t0 = time.time()
     for i, job in enumerate(jobs.itertuples(index=False), 1):
-        try:
-            emb = embed_audio(Path(job.abs_path), interpreter, input_idx, emb_idx)
-        except Exception as e:
-            print(f"  ! [{i}/{len(jobs)}] {job.filepath}: {type(e).__name__}: {e}")
+        needed_aug_ids = list(range(args.augment + 1)) if job.split == "train" else [0]
+        todo = [a for a in needed_aug_ids if (job.filepath, a) not in done_keys]
+        if not todo:
+            skipped_audios += 1
             continue
-        rows.append({
-            "filepath": job.filepath,
-            "species": job.species,
-            "split": job.split,
-            "embedding": emb.tolist(),
-        })
+
+        try:
+            y = load_waveform(Path(job.abs_path))
+        except Exception as e:
+            print(f"  ! [{i}/{len(jobs)}] {job.filepath} (load): {type(e).__name__}: {e}")
+            failures += 1
+            continue
+
+        for aug_id in todo:
+            try:
+                if aug_id == 0:
+                    emb = embed_waveform(y, interpreter, input_idx, emb_idx)
+                else:
+                    np.random.seed(aug_seed(args.augment_seed, job.filepath, aug_id))
+                    y_aug = aug_pipe(samples=y.copy(), sample_rate=SAMPLE_RATE)
+                    emb = embed_waveform(y_aug, interpreter, input_idx, emb_idx)
+            except Exception as e:
+                print(f"  ! [{i}/{len(jobs)}] {job.filepath} (aug_id={aug_id}): {type(e).__name__}: {e}")
+                failures += 1
+                continue
+
+            rows.append({
+                "filepath": job.filepath,
+                "species": job.species,
+                "split": job.split,
+                "embedding": emb.tolist(),
+                "is_aug": aug_id > 0,
+                "aug_id": aug_id,
+            })
+
         if i % 50 == 0 or i == len(jobs):
             elapsed = time.time() - t0
             rate = i / elapsed if elapsed > 0 else 0
             eta = (len(jobs) - i) / rate if rate > 0 else 0
             print(f"  [{i}/{len(jobs)}] {rate:.1f} aud/s, ETA {eta/60:.1f} min")
 
-    if not rows:
+    print(f"\nResumen: {len(rows)} embeddings nuevos, {skipped_audios} audios skipped (resume), {failures} fallos.")
+    if not rows and not (args.resume and OUT_PARQUET.exists()):
         print("! Ningún embedding extraído.")
         return 1
 
@@ -162,17 +228,21 @@ def main() -> int:
 
     if args.resume and OUT_PARQUET.exists():
         df_existing = pd.read_parquet(OUT_PARQUET)
+        if "aug_id" not in df_existing.columns:
+            df_existing["aug_id"] = 0
+            df_existing["is_aug"] = False
         df = pd.concat([df_existing, df_new], ignore_index=True)
-        df = df.drop_duplicates(subset=["filepath"], keep="last")
+        df = df.drop_duplicates(subset=["filepath", "aug_id"], keep="last")
     else:
         df = df_new
 
     df.to_parquet(OUT_PARQUET, index=False)
     size_mb = OUT_PARQUET.stat().st_size / 1024 / 1024
     print(f"\nEscrito {OUT_PARQUET} ({size_mb:.1f} MB, {len(df)} filas)")
-    print(f"  train:     {(df['split']=='train').sum()}")
-    print(f"  test_hard: {(df['split']=='test_hard').sum()}")
-    print(f"  especies:  {df['species'].nunique()}")
+    print(f"  train:        {(df['split']=='train').sum()}  ({df.loc[df['split']=='train', 'is_aug'].sum()} aumentados)")
+    print(f"  test_hard:    {(df['split']=='test_hard').sum()}")
+    print(f"  especies:     {df['species'].nunique()}")
+    print(f"  audios únicos:{df['filepath'].nunique()}")
     return 0
 
 
