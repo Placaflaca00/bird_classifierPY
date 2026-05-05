@@ -51,6 +51,10 @@ DEFAULTS: dict[str, Any] = {
     "hidden_dims": (256, 128),
     "mixup_alpha": 0.0,
     "use_class_weights": False,
+    # Especies a excluir del mapping y de los datasets (sin tocar los parquets).
+    # Útil para descartar clases con poca data o problemáticas. Tupla, no lista,
+    # para que sea hashable y serialice limpio en W&B config.
+    "drop_species": (),
     "early_stopping_patience": 8,
     "seed": 42,
     "run_name": "baseline-v0",
@@ -70,12 +74,17 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     project = os.environ["WANDB_PROJECT"].strip()
     entity = os.environ["WANDB_ENTITY"].strip()
 
-    species_to_idx = load_species_mapping()
+    drop_species = list(cfg["drop_species"])
+    species_to_idx = load_species_mapping(drop_species=drop_species)
     num_classes = len(species_to_idx)
     idx_to_species = {i: s for s, i in species_to_idx.items()}
     class_names = [idx_to_species[i] for i in range(num_classes)]
+    if drop_species:
+        print(f"Especies excluidas: {drop_species}")
 
-    loaders = build_dataloaders(batch_size=cfg["batch_size"])
+    loaders = build_dataloaders(
+        batch_size=cfg["batch_size"], drop_species=drop_species
+    )
     print(
         f"Sizes: train={len(loaders['train'].dataset)} "
         f"val={len(loaders['val'].dataset)} "
@@ -189,7 +198,11 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     # Matrices de confusión para test_clean y test_hard usando el best ckpt.
     # Recargo el modelo desde el checkpoint (los pesos en memoria pueden no
     # ser los del best — trainer.test no muta el modelo en memoria).
-    best_model = BirdClassifier.load_from_checkpoint(ckpt_cb.best_model_path)
+    # strict=False: tolera checkpoints viejos que guardaron class_weights como
+    # buffer persistente (ya no lo hacemos, pero el flag es defensivo).
+    best_model = BirdClassifier.load_from_checkpoint(
+        ckpt_cb.best_model_path, strict=False
+    )
     best_model.eval()
     for fold in ("test_clean", "test_hard"):
         if len(loaders[fold].dataset) == 0:

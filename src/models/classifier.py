@@ -41,8 +41,15 @@ class BirdClassifier(L.LightningModule):
         # mejor como buffer (sigue al device, va al checkpoint).
         self.save_hyperparameters(ignore=["class_weights"])
 
+        # persistent=False: NO se guarda en state_dict. Los pesos son
+        # hiperparámetros de la loss, no del modelo, y los checkpoints se
+        # recargan en eval donde class_weights es irrelevante.
         if class_weights is not None:
-            self.register_buffer("class_weights", class_weights.clone().float())
+            self.register_buffer(
+                "class_weights",
+                class_weights.clone().float(),
+                persistent=False,
+            )
         else:
             self.class_weights = None
 

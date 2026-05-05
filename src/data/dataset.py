@@ -11,6 +11,7 @@ misma codificación de clases.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -25,26 +26,39 @@ SPLITS_PATH = ROOT / "data" / "processed" / "splits.parquet"
 VALID_FOLDS = {"train", "val", "test_clean", "test_hard"}
 
 
-def load_species_mapping() -> dict[str, int]:
-    """species -> class_idx. Alfabético, determinístico."""
+def load_species_mapping(drop_species: Sequence[str] | None = None) -> dict[str, int]:
+    """species -> class_idx. Alfabético, determinístico.
+
+    drop_species: lista de nombres de especie a excluir del mapping. Útil para
+    entrenar/evaluar con subset de clases sin tocar los artifacts.
+    """
     df = pd.read_parquet(EMB_PATH, columns=["species"])
-    species = sorted(df["species"].unique())
+    drop = set(drop_species or [])
+    species = sorted(s for s in df["species"].unique() if s not in drop)
     return {sp: i for i, sp in enumerate(species)}
 
 
 class BirdEmbeddingsDataset(Dataset):
     """Carga embeddings de un fold específico en memoria como tensores."""
 
-    def __init__(self, fold: str, species_to_idx: dict[str, int] | None = None) -> None:
+    def __init__(
+        self,
+        fold: str,
+        species_to_idx: dict[str, int] | None = None,
+        drop_species: Sequence[str] | None = None,
+    ) -> None:
         if fold not in VALID_FOLDS:
             raise ValueError(f"fold inválido: {fold!r}. Debe ser uno de {VALID_FOLDS}")
 
         emb = pd.read_parquet(EMB_PATH)
         splits = pd.read_parquet(SPLITS_PATH)
         df = emb.merge(splits, on="filepath", how="inner")
-        df = df[df["fold"] == fold].reset_index(drop=True)
+        df = df[df["fold"] == fold]
+        if drop_species:
+            df = df[~df["species"].isin(set(drop_species))]
+        df = df.reset_index(drop=True)
 
-        self.species_to_idx = species_to_idx or load_species_mapping()
+        self.species_to_idx = species_to_idx or load_species_mapping(drop_species=drop_species)
         self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
         self.fold = fold
         self.filepaths: list[str] = df["filepath"].tolist()
@@ -71,12 +85,13 @@ class BirdEmbeddingsDataset(Dataset):
 def build_dataloaders(
     batch_size: int = 64,
     num_workers: int = 0,
+    drop_species: Sequence[str] | None = None,
 ) -> dict[str, DataLoader]:
     """Crea DataLoaders para los 4 folds. Usa el mismo species->idx en todos."""
-    species_to_idx = load_species_mapping()
+    species_to_idx = load_species_mapping(drop_species=drop_species)
     loaders: dict[str, DataLoader] = {}
     for fold in ("train", "val", "test_clean", "test_hard"):
-        ds = BirdEmbeddingsDataset(fold, species_to_idx)
+        ds = BirdEmbeddingsDataset(fold, species_to_idx, drop_species=drop_species)
         loaders[fold] = DataLoader(
             ds,
             batch_size=batch_size,

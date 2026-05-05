@@ -38,7 +38,11 @@
       "Bash(tasklist /v /fo csv)",
       "PowerShell(Get-Process *)",
       "PowerShell(Stop-Process *)",
-      "Bash(grep *)"
+      "Bash(grep *)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(curl -s https://api.github.com/repos/Athospd/wikiaves/contents/R)",
+      "Bash(curl *)"
     ]
   }
 }
