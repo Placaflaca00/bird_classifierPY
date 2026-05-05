@@ -34,9 +34,17 @@ class BirdClassifier(L.LightningModule):
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
         mixup_alpha: float = 0.0,
+        class_weights: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters()
+        # Ignoramos class_weights en hparams: es un tensor y Lightning lo guarda
+        # mejor como buffer (sigue al device, va al checkpoint).
+        self.save_hyperparameters(ignore=["class_weights"])
+
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights.clone().float())
+        else:
+            self.class_weights = None
 
         h1, h2 = hidden_dims
         self.net = nn.Sequential(
@@ -60,18 +68,19 @@ class BirdClassifier(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
+        w = self.class_weights  # None o tensor (C,) — se aplica SOLO en train
         alpha = self.hparams.mixup_alpha
         if alpha > 0.0 and x.size(0) > 1:
             lam = float(np.random.beta(alpha, alpha))
             perm = torch.randperm(x.size(0), device=x.device)
             x_mix = lam * x + (1.0 - lam) * x[perm]
             logits = self(x_mix)
-            loss = lam * F.cross_entropy(logits, y) + (1.0 - lam) * F.cross_entropy(logits, y[perm])
+            loss = lam * F.cross_entropy(logits, y, weight=w) + (1.0 - lam) * F.cross_entropy(logits, y[perm], weight=w)
             # train_acc se mide contra y "original" (informativo, no exacto bajo mixup)
             self.train_acc(logits, y)
         else:
             logits = self(x)
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits, y, weight=w)
             self.train_acc(logits, y)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("train_acc", self.train_acc, on_step=False, on_epoch=True, prog_bar=True)

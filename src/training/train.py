@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import Any
 
 import lightning as L
+import numpy as np
+import torch
+import wandb
 from dotenv import load_dotenv
 from lightning.pytorch.callbacks import (
     EarlyStopping,
@@ -47,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "dropout": 0.3,
     "hidden_dims": (256, 128),
     "mixup_alpha": 0.0,
+    "use_class_weights": False,
     "early_stopping_patience": 8,
     "seed": 42,
     "run_name": "baseline-v0",
@@ -68,6 +72,8 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
 
     species_to_idx = load_species_mapping()
     num_classes = len(species_to_idx)
+    idx_to_species = {i: s for s, i in species_to_idx.items()}
+    class_names = [idx_to_species[i] for i in range(num_classes)]
 
     loaders = build_dataloaders(batch_size=cfg["batch_size"])
     print(
@@ -78,6 +84,23 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     )
     print(f"num_classes: {num_classes}")
 
+    # Class weights estilo sklearn-balanced: w_c = N / (C * n_c)
+    # Solo se aplican a train_loss (val/test quedan sin pesar para mantener
+    # las métricas comparables con runs anteriores).
+    class_weights_t: torch.Tensor | None = None
+    if cfg["use_class_weights"]:
+        train_labels = loaders["train"].dataset.labels.numpy()
+        counts = np.bincount(train_labels, minlength=num_classes)
+        if (counts == 0).any():
+            missing = [class_names[i] for i, c in enumerate(counts) if c == 0]
+            raise RuntimeError(f"Clases sin ejemplos en train: {missing}")
+        weights = train_labels.shape[0] / (num_classes * counts)
+        class_weights_t = torch.tensor(weights, dtype=torch.float32)
+        print(
+            f"Class weights: min={weights.min():.3f}  max={weights.max():.3f}  "
+            f"mean={weights.mean():.3f}"
+        )
+
     model = BirdClassifier(
         num_classes=num_classes,
         embedding_dim=1024,
@@ -86,6 +109,7 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         lr=cfg["lr"],
         weight_decay=cfg["weight_decay"],
         mixup_alpha=cfg["mixup_alpha"],
+        class_weights=class_weights_t,
     )
 
     logger = WandbLogger(
@@ -161,6 +185,34 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         for k, v in metrics.items():
             clean_k = k.replace("test_", "")
             logger.experiment.summary[f"final/{fold}_{clean_k}"] = v
+
+    # Matrices de confusión para test_clean y test_hard usando el best ckpt.
+    # Recargo el modelo desde el checkpoint (los pesos en memoria pueden no
+    # ser los del best — trainer.test no muta el modelo en memoria).
+    best_model = BirdClassifier.load_from_checkpoint(ckpt_cb.best_model_path)
+    best_model.eval()
+    for fold in ("test_clean", "test_hard"):
+        if len(loaders[fold].dataset) == 0:
+            continue
+        all_preds: list[np.ndarray] = []
+        all_labels: list[np.ndarray] = []
+        with torch.no_grad():
+            for x, y in loaders[fold]:
+                logits = best_model(x)
+                all_preds.append(logits.argmax(dim=1).cpu().numpy())
+                all_labels.append(y.cpu().numpy())
+        preds = np.concatenate(all_preds)
+        labels = np.concatenate(all_labels)
+        logger.experiment.log(
+            {
+                f"confmat/{fold}": wandb.plot.confusion_matrix(
+                    y_true=labels.tolist(),
+                    preds=preds.tolist(),
+                    class_names=class_names,
+                )
+            }
+        )
+        print(f"  confmat/{fold} loggeada a W&B")
 
     return {
         "best_ckpt": ckpt_cb.best_model_path,
