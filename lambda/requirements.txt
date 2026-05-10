@@ -1,9 +1,18 @@
-# Runtime dependencies for the AWS Lambda inference image.
-# Keep this list MINIMAL — every MB increases cold-start time.
-# Pinning is intentionally loose at the scaffolding stage; tighten before deploy.
+# Runtime dependencies para la imagen AWS Lambda (Python 3.12 / AL2023).
+# Mantener al mínimo: cada MB inflado = cold-start más lento.
+# Versiones pinneadas para builds reproducibles.
 
-tflite-runtime
-onnxruntime
-librosa
-numpy
-soundfile
+# Runtime de inferencia BirdNET TFLite (LiteRT, GA desde TF 2.21, reemplaza tflite-runtime)
+# Requiere manylinux_2_27+ -> AL2023 obligatorio (glibc 2.34).
+ai-edge-litert==2.1.4
+
+# Runtime de inferencia ONNX
+onnxruntime==1.26.0
+
+# Audio I/O: soundfile 0.13.1 trae libsndfile 1.1+ bundleado (con soporte MP3 nativo).
+# librosa solo se usa para load + resample a 48 kHz.
+librosa==0.11.0
+soundfile==0.13.1
+
+# Bound de numpy: onnxruntime 1.26 soporta numpy 2.x.
+numpy>=2.0,<3

@@ -43,7 +43,10 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.data.augmentations import build_audio_pipeline  # noqa: E402
+from src.data.augmentations import (  # noqa: E402
+    build_audio_pipeline_aggressive,
+    build_audio_pipeline_conservative,
+)
 
 RAW_DIR = ROOT / "data" / "raw"
 TEST_DIR = ROOT / "data" / "test_sets" / "xc_hard"
@@ -53,6 +56,36 @@ OUT_PARQUET = OUT_DIR / "embeddings.parquet"
 SAMPLE_RATE = 48_000
 WINDOW_SAMPLES = 144_000  # 3 sec @ 48 kHz
 EMBEDDING_DIM = 1024
+
+# Política tiered K por especie (post-cleanup label noise, 2026-05-09).
+# Target: ~150-220 train rows post-aug por especie. Calculado contra N train
+# de splits.parquet del dataset wa-drop3 limpio.
+AUG_K_TIERED: dict[str, int] = {
+    # N >= 150 -> K=0 (ya tienen suficiente)
+    "Tringa flavipes": 0,
+    "Tringa melanoleuca": 0,
+    "Calidris canutus": 0,
+    # N 80-149 -> K=1
+    "Actitis macularius": 1,
+    "Ara ararauna": 1,
+    "Calidris minutilla": 1,
+    "Ramphastos toco": 1,
+    # N 50-79 -> K=2
+    "Calidris pusilla": 2,
+    "Chauna torquata": 2,
+    "Ortalis canicollis": 2,
+    "Calidris melanotos": 2,
+    "Calidris bairdii": 2,
+    "Pluvialis dominica": 2,
+    # N < 50 -> K=3
+    "Jabiru mycteria": 3,
+    "Pluvialis squatarola": 3,
+    "Pipile jacutinga": 3,
+    "Columba livia": 3,
+    "Calidris fuscicollis": 3,
+    "Heliornis fulica": 3,
+    "Rhea americana": 3,
+}
 
 
 def build_interpreter():
@@ -139,7 +172,12 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true",
                         help="Saltear (filepath, aug_id) ya presentes en el parquet.")
     parser.add_argument("--augment", type=int, default=0,
-                        help="K copias aumentadas por audio del split=train (0 = sin augmentation).")
+                        help="K copias aumentadas por audio del split=train (uniforme). Si --aug-policy=tiered, este valor se ignora salvo como fallback.")
+    parser.add_argument("--aug-policy", default="uniform", choices=["uniform", "tiered"],
+                        help="uniform: K igual para todos. tiered: K por especie según AUG_K_TIERED.")
+    parser.add_argument("--aug-pipeline", default="conservative",
+                        choices=["conservative", "aggressive"],
+                        help="conservative: SNR+Shift+Gain (Fase 3). aggressive: + PitchShift + TimeStretch + LowPass (Fase 5 OOD-aware).")
     parser.add_argument("--augment-seed", type=int, default=42,
                         help="Base seed para aumentaciones (reproducibilidad).")
     args = parser.parse_args()
@@ -154,11 +192,27 @@ def main() -> int:
     if args.limit:
         jobs = jobs.head(args.limit).copy()
 
+    def k_for(species: str) -> int:
+        if args.aug_policy == "tiered":
+            return AUG_K_TIERED.get(species, args.augment)
+        return args.augment
+
     n_train = int((jobs["split"] == "train").sum())
     n_test = int((jobs["split"] == "test_hard").sum())
-    rows_target = n_train * (args.augment + 1) + n_test
+    train_jobs = jobs[jobs["split"] == "train"]
+    rows_train_aug = sum(k_for(sp) + 1 for sp in train_jobs["species"]) if args.aug_policy == "tiered" \
+                     else n_train * (args.augment + 1)
+    rows_target = rows_train_aug + n_test
+
     print(f"Audios a procesar: {len(jobs)}")
-    print(f"  train:     {n_train}  (augment K={args.augment} -> {n_train * (args.augment + 1)} embeddings)")
+    print(f"  train:     {n_train}  -> {rows_train_aug} embeddings (policy={args.aug_policy}, pipeline={args.aug_pipeline})")
+    if args.aug_policy == "tiered":
+        per_sp = train_jobs.groupby("species").size().rename("N").to_frame()
+        per_sp["K"] = per_sp.index.map(lambda s: AUG_K_TIERED.get(s, args.augment))
+        per_sp["post_aug"] = per_sp["N"] * (per_sp["K"] + 1)
+        print("    K por especie (sorted by N descendente):")
+        for sp, row in per_sp.sort_values("N", ascending=False).iterrows():
+            print(f"      {sp:30s}  N={row['N']:>4}  K={row['K']}  post_aug={row['post_aug']:>4}")
     print(f"  test_hard: {n_test}")
     print(f"Embeddings totales esperados: {rows_target}")
 
@@ -167,7 +221,14 @@ def main() -> int:
         done_keys = load_done_keys(OUT_PARQUET)
         print(f"Resume: {len(done_keys)} (filepath, aug_id) ya en parquet.")
 
-    aug_pipe = build_audio_pipeline() if args.augment > 0 else None
+    needs_aug = (args.augment > 0) or (
+        args.aug_policy == "tiered" and any(v > 0 for v in AUG_K_TIERED.values())
+    )
+    if needs_aug:
+        aug_pipe = (build_audio_pipeline_aggressive() if args.aug_pipeline == "aggressive"
+                    else build_audio_pipeline_conservative())
+    else:
+        aug_pipe = None
 
     print("\nCargando BirdNET TFLite...")
     interpreter, input_idx, emb_idx = build_interpreter()
@@ -178,7 +239,8 @@ def main() -> int:
     failures = 0
     t0 = time.time()
     for i, job in enumerate(jobs.itertuples(index=False), 1):
-        needed_aug_ids = list(range(args.augment + 1)) if job.split == "train" else [0]
+        k = k_for(job.species) if job.split == "train" else 0
+        needed_aug_ids = list(range(k + 1)) if job.split == "train" else [0]
         todo = [a for a in needed_aug_ids if (job.filepath, a) not in done_keys]
         if not todo:
             skipped_audios += 1

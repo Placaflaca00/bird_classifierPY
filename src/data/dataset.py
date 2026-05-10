@@ -54,6 +54,12 @@ class BirdEmbeddingsDataset(Dataset):
         splits = pd.read_parquet(SPLITS_PATH)
         df = emb.merge(splits, on="filepath", how="inner")
         df = df[df["fold"] == fold]
+        # Augmentation se aplica a todos los archivos del split=train origen, lo
+        # que en runtime termina contaminando val/test_clean (que también
+        # vienen del split=train origen). Filtramos is_aug para todo lo que NO
+        # sea fold=train, así val/test mantienen 1 fila por audio físico.
+        if fold != "train" and "is_aug" in df.columns:
+            df = df[~df["is_aug"]]
         if drop_species:
             df = df[~df["species"].isin(set(drop_species))]
         df = df.reset_index(drop=True)

@@ -1,0 +1,25 @@
+{
+  "_comment": "Nombres comunes ES (rioplatense/Paraguay) + EN (estándar ornitológico, Avibase/eBird). Separado de models/classifier.json (model card de training) para poder corregirse sin retrainear ni romper el contrato del modelo. Bakeado dentro de la imagen Docker.",
+  "species": {
+    "Actitis macularius":     { "es": "Playerito manchado",         "en": "Spotted Sandpiper" },
+    "Ara ararauna":           { "es": "Guacamayo azul y amarillo",  "en": "Blue-and-yellow Macaw" },
+    "Calidris bairdii":       { "es": "Playerito de Baird",         "en": "Baird's Sandpiper" },
+    "Calidris canutus":       { "es": "Playero rojizo",             "en": "Red Knot" },
+    "Calidris fuscicollis":   { "es": "Playerito de rabadilla blanca", "en": "White-rumped Sandpiper" },
+    "Calidris melanotos":     { "es": "Playerito pectoral",         "en": "Pectoral Sandpiper" },
+    "Calidris minutilla":     { "es": "Playerito menudo",           "en": "Least Sandpiper" },
+    "Calidris pusilla":       { "es": "Playerito semipalmado",      "en": "Semipalmated Sandpiper" },
+    "Chauna torquata":        { "es": "Chajá",                       "en": "Southern Screamer" },
+    "Columba livia":          { "es": "Paloma doméstica",            "en": "Rock Pigeon" },
+    "Heliornis fulica":       { "es": "Ipequí",                      "en": "Sungrebe" },
+    "Jabiru mycteria":        { "es": "Jabirú",                      "en": "Jabiru" },
+    "Ortalis canicollis":     { "es": "Charata",                     "en": "Chaco Chachalaca" },
+    "Pipile jacutinga":       { "es": "Yacutinga",                   "en": "Black-fronted Piping-guan" },
+    "Pluvialis dominica":     { "es": "Chorlo dorado",               "en": "American Golden-Plover" },
+    "Pluvialis squatarola":   { "es": "Chorlo gris",                 "en": "Black-bellied Plover" },
+    "Ramphastos toco":        { "es": "Tucán toco",                  "en": "Toco Toucan" },
+    "Rhea americana":         { "es": "Ñandú",                       "en": "Greater Rhea" },
+    "Tringa flavipes":        { "es": "Pitotoy chico",               "en": "Lesser Yellowlegs" },
+    "Tringa melanoleuca":     { "es": "Pitotoy grande",              "en": "Greater Yellowlegs" }
+  }
+}

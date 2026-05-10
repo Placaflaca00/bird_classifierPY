@@ -21,6 +21,12 @@ SPLITS_PATH = ROOT / "data" / "processed" / "splits.parquet"
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--upload", action="store_true")
+    parser.add_argument("--alias", action="append", default=[],
+                        help="Alias adicional para esta versión (repetible). Ej: --alias wa-drop3")
+    parser.add_argument("--embeddings-artifact", default="embeddings:v0",
+                        help="Artifact de embeddings al que linkea para lineage. Default: embeddings:v0")
+    parser.add_argument("--run-name", default=None,
+                        help="Override run name. Default: splits-<aliases> o splits-v0")
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -44,15 +50,16 @@ def main() -> int:
 
     project = os.environ["WANDB_PROJECT"].strip()
     entity = os.environ["WANDB_ENTITY"].strip()
+    run_name = args.run_name or (f"splits-{'-'.join(args.alias)}" if args.alias else "splits-v0")
     run = wandb.init(
         entity=entity,
         project=project,
         job_type="splits",
-        name="splits-v0",
+        name=run_name,
         notes="Tiered split por especie: 70/15/15 + mínimos según N. seed=42.",
     )
-    run.use_artifact("embeddings:v0")
-    print("  use_artifact(embeddings:v0) OK")
+    run.use_artifact(args.embeddings_artifact)
+    print(f"  use_artifact({args.embeddings_artifact}) OK")
 
     artifact = wandb.Artifact(
         name="splits",
@@ -66,10 +73,11 @@ def main() -> int:
             "seed": 42,
             "policy": "tiered_per_species",
             "fold_counts": {k: int(v) for k, v in counts.items()},
+            "embeddings_artifact": args.embeddings_artifact,
         },
     )
     artifact.add_file(str(SPLITS_PATH))
-    run.log_artifact(artifact)
+    run.log_artifact(artifact, aliases=args.alias or None)
     run.finish()
     print(f"\nListo. https://wandb.ai/{entity}/{project}")
     return 0

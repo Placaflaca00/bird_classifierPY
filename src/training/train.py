@@ -19,12 +19,14 @@ Pipeline:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
 import lightning as L
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import wandb
@@ -34,7 +36,8 @@ from lightning.pytorch.callbacks import (
     LearningRateMonitor,
     ModelCheckpoint,
 )
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -63,6 +66,9 @@ DEFAULTS: dict[str, Any] = {
     # apuntar a versiones aumentadas u otras splits.
     "embeddings_artifact": "embeddings:v0",
     "splits_artifact": "splits:v0",
+    # Modo local: usa CSVLogger en vez de WandbLogger. No llama use_artifact
+    # ni loggea a W&B summary. Las confmat se guardan como PNG en checkpoints/<run>/.
+    "local": False,
 }
 
 
@@ -71,8 +77,11 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     L.seed_everything(cfg["seed"], workers=True)
 
     load_dotenv(ROOT / ".env")
-    project = os.environ["WANDB_PROJECT"].strip()
-    entity = os.environ["WANDB_ENTITY"].strip()
+    if not cfg["local"]:
+        project = os.environ["WANDB_PROJECT"].strip()
+        entity = os.environ["WANDB_ENTITY"].strip()
+    else:
+        project = entity = None
 
     drop_species = list(cfg["drop_species"])
     species_to_idx = load_species_mapping(drop_species=drop_species)
@@ -121,18 +130,24 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         class_weights=class_weights_t,
     )
 
-    logger = WandbLogger(
-        project=project,
-        entity=entity,
-        name=cfg["run_name"],
-        job_type="train",
-        tags=cfg["tags"],
-        config=cfg,
-        save_dir=str(ROOT / "wandb"),
-    )
-    # Lineage: declarar inputs ANTES de fit
-    logger.experiment.use_artifact(cfg["embeddings_artifact"])
-    logger.experiment.use_artifact(cfg["splits_artifact"])
+    if cfg["local"]:
+        logger = CSVLogger(
+            save_dir=str(ROOT / "logs"),
+            name=cfg["run_name"],
+        )
+    else:
+        logger = WandbLogger(
+            project=project,
+            entity=entity,
+            name=cfg["run_name"],
+            job_type="train",
+            tags=cfg["tags"],
+            config=cfg,
+            save_dir=str(ROOT / "wandb"),
+        )
+        # Lineage: declarar inputs ANTES de fit
+        logger.experiment.use_artifact(cfg["embeddings_artifact"])
+        logger.experiment.use_artifact(cfg["splits_artifact"])
 
     ckpt_dir = ROOT / "checkpoints" / cfg["run_name"]
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -189,11 +204,12 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
             f"macro_f1={final_results[fold]['test_macro_f1']:.4f}"
         )
 
-    # Resumen en W&B summary (con prefijo claro)
-    for fold, metrics in final_results.items():
-        for k, v in metrics.items():
-            clean_k = k.replace("test_", "")
-            logger.experiment.summary[f"final/{fold}_{clean_k}"] = v
+    # Resumen: si W&B, va a summary; si local, sólo print (ya impreso arriba).
+    if not cfg["local"]:
+        for fold, metrics in final_results.items():
+            for k, v in metrics.items():
+                clean_k = k.replace("test_", "")
+                logger.experiment.summary[f"final/{fold}_{clean_k}"] = v
 
     # Matrices de confusión para test_clean y test_hard usando el best ckpt.
     # Recargo el modelo desde el checkpoint (los pesos en memoria pueden no
@@ -216,16 +232,28 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
                 all_labels.append(y.cpu().numpy())
         preds = np.concatenate(all_preds)
         labels = np.concatenate(all_labels)
-        logger.experiment.log(
-            {
-                f"confmat/{fold}": wandb.plot.confusion_matrix(
-                    y_true=labels.tolist(),
-                    preds=preds.tolist(),
-                    class_names=class_names,
-                )
-            }
-        )
-        print(f"  confmat/{fold} loggeada a W&B")
+        if cfg["local"]:
+            cm = confusion_matrix(labels, preds, labels=list(range(num_classes)))
+            disp = ConfusionMatrixDisplay(cm, display_labels=class_names)
+            fig, ax = plt.subplots(figsize=(12, 12))
+            disp.plot(ax=ax, xticks_rotation=45, cmap="Blues", values_format="d", colorbar=False)
+            ax.set_title(f"{cfg['run_name']} — confmat {fold}")
+            fig.tight_layout()
+            png_path = ckpt_dir / f"confmat_{fold}.png"
+            fig.savefig(png_path, dpi=120)
+            plt.close(fig)
+            print(f"  confmat/{fold} -> {png_path}")
+        else:
+            logger.experiment.log(
+                {
+                    f"confmat/{fold}": wandb.plot.confusion_matrix(
+                        y_true=labels.tolist(),
+                        preds=preds.tolist(),
+                        class_names=class_names,
+                    )
+                }
+            )
+            print(f"  confmat/{fold} loggeada a W&B")
 
     return {
         "best_ckpt": ckpt_cb.best_model_path,
@@ -234,5 +262,40 @@ def train(config_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
+def _parse_cli() -> dict[str, Any]:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--local", action="store_true",
+                   help="No usa W&B. CSVLogger + confmat PNG local.")
+    p.add_argument("--run-name", default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=None)
+    p.add_argument("--use-class-weights", action="store_true")
+    p.add_argument("--mixup-alpha", type=float, default=None)
+    p.add_argument("--drop-species", nargs="*", default=None,
+                   help="Lista de species a excluir (formato científico).")
+    p.add_argument("--tags", nargs="*", default=None)
+    p.add_argument("--embeddings-artifact", default=None,
+                   help="Artifact W&B de embeddings (formato 'name:version'). Solo aplica sin --local.")
+    p.add_argument("--splits-artifact", default=None,
+                   help="Artifact W&B de splits.")
+    args = p.parse_args()
+    overrides: dict[str, Any] = {}
+    if args.local: overrides["local"] = True
+    if args.run_name: overrides["run_name"] = args.run_name
+    if args.epochs is not None: overrides["max_epochs"] = args.epochs
+    if args.lr is not None: overrides["lr"] = args.lr
+    if args.batch_size is not None: overrides["batch_size"] = args.batch_size
+    if args.dropout is not None: overrides["dropout"] = args.dropout
+    if args.use_class_weights: overrides["use_class_weights"] = True
+    if args.mixup_alpha is not None: overrides["mixup_alpha"] = args.mixup_alpha
+    if args.drop_species is not None: overrides["drop_species"] = tuple(args.drop_species)
+    if args.tags is not None: overrides["tags"] = list(args.tags)
+    if args.embeddings_artifact: overrides["embeddings_artifact"] = args.embeddings_artifact
+    if args.splits_artifact: overrides["splits_artifact"] = args.splits_artifact
+    return overrides
+
+
 if __name__ == "__main__":
-    train()
+    train(_parse_cli())

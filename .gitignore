@@ -171,8 +171,23 @@ data/test_sets/*
 !data/test_sets/.gitkeep
 !data/README.md
 
+# Backups de audios (renombrados durante limpieza/cleanup)
+data/raw_backup_*/
+data/raw_label_noise_backup_*/
+data/test_sets_backup_*/
+data/test_sets_label_noise_backup_*/
+
 # Sidecar files que sí se ignoran
 data/raw/.failed_urls.txt
+
+# Artefactos de entrenamiento / inferencia (tracked vía W&B Artifacts, no git)
+checkpoints/
+logs/
+models/
+lambda/models/
+
+# Reports generados localmente (parquets, csvs, pngs, logs)
+reports/
 
 # Local secrets / scratch
 *.local

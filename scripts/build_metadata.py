@@ -42,9 +42,10 @@ RAW_DIR = ROOT / "data" / "raw"
 OUT_PATH = RAW_DIR / "metadata.parquet"
 GBIF_PATH = RAW_DIR / "metadata_gbif.parquet"
 XC_PATH = RAW_DIR / "metadata.parquet"
+WA_CSV = RAW_DIR / "wikiaves_metadata.csv"
 
 ALLOWED_RATINGS = {"A", "B", "no-score"}
-ALLOWED_SOURCES = {"gbif", "xenocanto"}
+ALLOWED_SOURCES = {"gbif", "xenocanto", "wikiaves"}
 
 
 @dataclass
@@ -93,8 +94,9 @@ def collect_disk_files(raw_dir: Path) -> list[str]:
     return files
 
 
-def build_lookup(parquets: list[Path]) -> dict[str, dict]:
-    """Mergea parquets existentes en un dict filepath -> {rating, source}."""
+def build_lookup(parquets: list[Path], wa_csv: Path | None = None) -> dict[str, dict]:
+    """Mergea parquets existentes (XC, GBIF) y opcionalmente CSV de WikiAves
+    en un dict filepath -> {rating, source}."""
     lookup: dict[str, dict] = {}
     for p in parquets:
         if not p.exists():
@@ -107,6 +109,12 @@ def build_lookup(parquets: list[Path]) -> dict[str, dict]:
                     "rating": str(row.get("rating", "no-score")),
                     "source": str(row.get("source", "unknown")),
                 }
+    if wa_csv is not None and wa_csv.exists():
+        wa = pd.read_csv(wa_csv)
+        for _, row in wa.iterrows():
+            fp = row["filepath"]
+            if fp not in lookup:
+                lookup[fp] = {"rating": "no-score", "source": "wikiaves"}
     return lookup
 
 
@@ -160,8 +168,8 @@ def main() -> int:
     disk_files = collect_disk_files(RAW_DIR)
     print(f"Archivos en disco: {len(disk_files)}")
 
-    lookup = build_lookup([XC_PATH, GBIF_PATH])
-    print(f"Lookup combinado (XC+GBIF): {len(lookup)} filepaths")
+    lookup = build_lookup([XC_PATH, GBIF_PATH], wa_csv=WA_CSV)
+    print(f"Lookup combinado (XC+GBIF+WA): {len(lookup)} filepaths")
     missing = [f for f in disk_files if f not in lookup]
     if missing:
         print(f"  ! {len(missing)} archivos sin metadata:")
