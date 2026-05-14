@@ -193,6 +193,7 @@ reports/
 *.local
 scratch/
 tmp/
+.lambda-setup/
 
 
 .claude/*

@@ -70,7 +70,29 @@
       "Bash(docker --version)",
       "Bash(docker info *)",
       "Bash(docker build *)",
-      "Bash(git check-ignore *)"
+      "Bash(git check-ignore *)",
+      "Bash(docker pull *)",
+      "Bash(docker run *)",
+      "Bash(docker stop *)",
+      "Bash(aws --version)",
+      "Bash(aws sts *)",
+      "Bash(aws ecr create-repository *)",
+      "Bash(aws ecr *)",
+      "Bash(docker login *)",
+      "Bash(docker tag *)",
+      "Bash(docker image *)",
+      "Bash(.venv/Scripts/python *)",
+      "Bash(aws iam *)",
+      "Bash(aws lambda *)",
+      "Bash(aws apigatewayv2 get-apis *)",
+      "PowerShell(cmd /c \"dir C:\\\\Users\\\\moha2\\\\Documents\\\\birdClassifier\\\\data\\\\test_sets\\\\ /b /a\" 2>&1 | Select-Object -First 20)",
+      "PowerShell(cmd /c \"dir C:\\\\Users\\\\moha2\\\\Documents\\\\birdClassifier\\\\data\\\\test_sets\\\\xc_hard\\\\chauna_torquata\\\\ /b\" 2>&1 | Select-Object -First 5)",
+      "PowerShell(Get-Content *)",
+      "PowerShell($env:API_GATEWAY_URL = \"https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/predict\"; .venv\\\\Scripts\\\\python.exe app\\\\client.py data\\\\test_sets\\\\xc_hard\\\\ortalis_canicollis\\\\XC343334.mp3 --top-k 3; \"exit=$LASTEXITCODE\")",
+      "PowerShell(Remove-Item *)",
+      "PowerShell($env:API_GATEWAY_URL = \"https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/noexiste\"; .venv\\\\Scripts\\\\python.exe app\\\\client.py data\\\\test_sets\\\\xc_hard\\\\ortalis_canicollis\\\\XC343334.mp3; \"exit=$LASTEXITCODE\")",
+      "PowerShell($env:API_GATEWAY_URL = \"https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/predict\"; .venv\\\\Scripts\\\\python.exe app\\\\_smoke_test.py; \"exit=$LASTEXITCODE\")",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe -m pip install -r app\\\\requirements.txt --quiet 2>&1 | Select-Object -Last 5; \"---\"; .venv\\\\Scripts\\\\python.exe -c \"import gradio; print\\('gradio', gradio.__version__\\)\")"
     ]
   }
 }

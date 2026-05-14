@@ -29,8 +29,8 @@ Cada decisión vive en su propio archivo `D<N>_<slug>.md` (e.g. `D01_birdnet_emb
 - [ ] D07 — Audiomentations + mixup como estrategia de augmentation.
 - [ ] D08 — Cleanlab para detección de label noise.
 - [ ] D09 — ONNX como formato de export para producción (vs TorchScript).
-- [ ] D10 — AWS Lambda + Docker + ECR como backend (vs SageMaker / EC2 / ECS).
-- [ ] D11 — API Gateway HTTP API (vs REST API).
+- [x] [D10 — AWS Lambda + Docker + ECR como backend (vs SageMaker / EC2 / ECS)](D10_lambda_docker_ecr.md).
+- [x] [D11 — API Gateway HTTP API (vs REST API)](D11_apigateway_http_api.md).
 - [ ] D12 — DynamoDB para flagging (vs Postgres / S3-only).
 - [ ] D13 — Gradio + HuggingFace Spaces como frontend (vs Streamlit / propia).
 - [ ] D14 — EvidentlyAI para drift monitoring (vs WhyLabs / casero).

@@ -14,12 +14,22 @@
 # Plataforma forzada a amd64 (Lambda x86_64; armaríamos arm64 aparte si vamos a Graviton).
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.12
 
-# Instalar dependencias Python. --no-cache-dir + limpieza de .pyc reduce ~30-50MB.
+# Cache dirs en /tmp: el filesystem de Lambda es read-only salvo /tmp. Las libs
+# de ML intentan escribir cache JIT/config en HOME o site-packages y rompen en
+# runtime con errores opacos ("no locator available", "permission denied").
+# - NUMBA_CACHE_DIR: librosa usa Numba para resample/filtros; sin esto explota.
+# - MPLCONFIGDIR: matplotlib (transitivo) intenta crear ~/.config/matplotlib.
+# - HF_HOME: huggingface_hub (transitivo) cachea en ~/.cache/huggingface.
+ENV NUMBA_CACHE_DIR=/tmp \
+    MPLCONFIGDIR=/tmp/matplotlib \
+    HF_HOME=/tmp/huggingface
+
+# Instalar dependencias Python. --no-cache-dir evita inflar la layer con el cache de pip.
+# No borramos .pyc: en Lambda los conservamos para acelerar cold start (Python no
+# recompila bytecode en cada init). Si la imagen final pasa ~1GB, pasamos a multi-stage
+# en vez de hacer cleanup post-install (que no reduce layers ya escritas).
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt \
- && find /var/lang/lib/python3.12 -name "__pycache__" -type d -exec rm -rf {} + \
- && find /var/lang/lib/python3.12 -name "*.pyc" -delete \
- && rm -rf /root/.cache /tmp/*
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 
 # Verificación build-time: libsndfile bundleado debe ser 1.1.0+ (soporte MP3).
 # Si esto falla, la imagen no se construye -> evitamos sorpresas en runtime.
