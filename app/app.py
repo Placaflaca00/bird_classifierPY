@@ -27,6 +27,7 @@ from pathlib import Path
 import gradio as gr
 
 from client import predict
+from validation import validate_audio
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -192,6 +193,17 @@ def classify(audio_path: str | None):
         return (
             hidden[0],
             gr.update(visible=True, value="Sube o graba un audio primero."),
+            hidden[1], hidden[2], hidden[3],
+        )
+
+    # Fase 2 - Nivel 1: validacion inline antes de invocar la Lambda.
+    # Si falla, ahorramos cold start y devolvemos un mensaje especifico.
+    validation = validate_audio(audio_path)
+    if not validation.ok:
+        hidden = _hidden_result()
+        return (
+            hidden[0],
+            gr.update(visible=True, value=validation.error_message),
             hidden[1], hidden[2], hidden[3],
         )
 
