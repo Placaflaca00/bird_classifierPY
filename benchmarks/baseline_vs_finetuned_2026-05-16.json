@@ -1,0 +1,403 @@
+{
+  "date": "2026-05-16",
+  "model": "wa-drop3-v1",
+  "birdnet_version": "V2.4 GLOBAL 6K",
+  "birdnet_n_classes": 6522,
+  "non_bird_n_excluded": 18,
+  "my_n_classes": 20,
+  "my_species": [
+    "Actitis macularius",
+    "Ara ararauna",
+    "Calidris bairdii",
+    "Calidris canutus",
+    "Calidris fuscicollis",
+    "Calidris melanotos",
+    "Calidris minutilla",
+    "Calidris pusilla",
+    "Chauna torquata",
+    "Columba livia",
+    "Heliornis fulica",
+    "Jabiru mycteria",
+    "Ortalis canicollis",
+    "Pipile jacutinga",
+    "Pluvialis dominica",
+    "Pluvialis squatarola",
+    "Ramphastos toco",
+    "Rhea americana",
+    "Tringa flavipes",
+    "Tringa melanoleuca"
+  ],
+  "mapping_matched": 19,
+  "mapping_missing": [
+    "Pipile jacutinga"
+  ],
+  "inference_seconds": 361.6434907913208,
+  "folds": {
+    "test_clean": {
+      "n": 351,
+      "baseline": {
+        "top1_micro": 0.7037037037037037,
+        "top1_macro": 0.6358947071598383,
+        "top3_micro": 0.8233618233618234,
+        "no_match_n": 99,
+        "conf_mean_max_sigmoid": 0.7715705612573529
+      },
+      "pipeline": {
+        "top1_micro": 0.9458689458689459,
+        "top1_macro": 0.9313871296319116,
+        "top3_micro": 0.98005698005698,
+        "conf_mean_softmax": 0.910953863691061
+      },
+      "birdnet_compatible_19_only": {
+        "n": 342,
+        "baseline_top1_micro": 0.7222222222222222,
+        "pipeline_top1_micro": 0.9444444444444444
+      },
+      "per_species": [
+        {
+          "species": "Actitis macularius",
+          "n": 31,
+          "baseline_acc": 0.7419354838709677,
+          "pipeline_acc": 0.9354838709677419,
+          "baseline_top3_acc": 0.8709677419354839,
+          "pipeline_top3_acc": 0.967741935483871
+        },
+        {
+          "species": "Ara ararauna",
+          "n": 29,
+          "baseline_acc": 0.7241379310344828,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.9655172413793104,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris bairdii",
+          "n": 12,
+          "baseline_acc": 0.6666666666666666,
+          "pipeline_acc": 0.8333333333333334,
+          "baseline_top3_acc": 0.75,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris canutus",
+          "n": 35,
+          "baseline_acc": 0.6285714285714286,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.6857142857142857,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris fuscicollis",
+          "n": 7,
+          "baseline_acc": 0.7142857142857143,
+          "pipeline_acc": 0.8571428571428571,
+          "baseline_top3_acc": 0.7142857142857143,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris melanotos",
+          "n": 14,
+          "baseline_acc": 0.6428571428571429,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.8571428571428571,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris minutilla",
+          "n": 22,
+          "baseline_acc": 0.5454545454545454,
+          "pipeline_acc": 0.8181818181818182,
+          "baseline_top3_acc": 0.6818181818181818,
+          "pipeline_top3_acc": 0.9090909090909091
+        },
+        {
+          "species": "Calidris pusilla",
+          "n": 17,
+          "baseline_acc": 0.7647058823529411,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.8823529411764706,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Chauna torquata",
+          "n": 17,
+          "baseline_acc": 1.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Columba livia",
+          "n": 8,
+          "baseline_acc": 0.75,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Heliornis fulica",
+          "n": 7,
+          "baseline_acc": 0.5714285714285714,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.5714285714285714,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Jabiru mycteria",
+          "n": 10,
+          "baseline_acc": 0.1,
+          "pipeline_acc": 0.9,
+          "baseline_top3_acc": 0.3,
+          "pipeline_top3_acc": 0.9
+        },
+        {
+          "species": "Ortalis canicollis",
+          "n": 17,
+          "baseline_acc": 0.8823529411764706,
+          "pipeline_acc": 0.9411764705882353,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Pipile jacutinga",
+          "n": 9,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Pluvialis dominica",
+          "n": 12,
+          "baseline_acc": 0.5833333333333334,
+          "pipeline_acc": 0.9166666666666666,
+          "baseline_top3_acc": 0.75,
+          "pipeline_top3_acc": 0.9166666666666666
+        },
+        {
+          "species": "Pluvialis squatarola",
+          "n": 10,
+          "baseline_acc": 0.8,
+          "pipeline_acc": 0.9,
+          "baseline_top3_acc": 0.9,
+          "pipeline_top3_acc": 0.9
+        },
+        {
+          "species": "Ramphastos toco",
+          "n": 20,
+          "baseline_acc": 0.9,
+          "pipeline_acc": 0.95,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Rhea americana",
+          "n": 6,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 0.6666666666666666,
+          "baseline_top3_acc": 0.16666666666666666,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Tringa flavipes",
+          "n": 33,
+          "baseline_acc": 0.7878787878787878,
+          "pipeline_acc": 0.9090909090909091,
+          "baseline_top3_acc": 0.9393939393939394,
+          "pipeline_top3_acc": 0.9696969696969697
+        },
+        {
+          "species": "Tringa melanoleuca",
+          "n": 35,
+          "baseline_acc": 0.9142857142857143,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        }
+      ]
+    },
+    "test_hard": {
+      "n": 208,
+      "baseline": {
+        "top1_micro": 0.3894230769230769,
+        "top1_macro": 0.34467268842268844,
+        "top3_micro": 0.6009615384615384,
+        "no_match_n": 123,
+        "conf_mean_max_sigmoid": 0.4861152515021296
+      },
+      "pipeline": {
+        "top1_micro": 0.8125,
+        "top1_macro": 0.8766666666666666,
+        "top3_micro": 0.8942307692307693,
+        "conf_mean_softmax": 0.758787057792338
+      },
+      "birdnet_compatible_19_only": {
+        "n": 207,
+        "baseline_top1_micro": 0.391304347826087,
+        "pipeline_top1_micro": 0.8115942028985508
+      },
+      "per_species": [
+        {
+          "species": "Actitis macularius",
+          "n": 21,
+          "baseline_acc": 0.3333333333333333,
+          "pipeline_acc": 0.6666666666666666,
+          "baseline_top3_acc": 0.47619047619047616,
+          "pipeline_top3_acc": 0.8095238095238095
+        },
+        {
+          "species": "Ara ararauna",
+          "n": 4,
+          "baseline_acc": 1.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris bairdii",
+          "n": 4,
+          "baseline_acc": 0.25,
+          "pipeline_acc": 0.75,
+          "baseline_top3_acc": 0.25,
+          "pipeline_top3_acc": 0.75
+        },
+        {
+          "species": "Calidris canutus",
+          "n": 30,
+          "baseline_acc": 0.23333333333333334,
+          "pipeline_acc": 0.9666666666666667,
+          "baseline_top3_acc": 0.43333333333333335,
+          "pipeline_top3_acc": 0.9666666666666667
+        },
+        {
+          "species": "Calidris fuscicollis",
+          "n": 2,
+          "baseline_acc": 0.5,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.5,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris melanotos",
+          "n": 15,
+          "baseline_acc": 0.26666666666666666,
+          "pipeline_acc": 0.4,
+          "baseline_top3_acc": 0.4,
+          "pipeline_top3_acc": 0.6666666666666666
+        },
+        {
+          "species": "Calidris minutilla",
+          "n": 11,
+          "baseline_acc": 0.2727272727272727,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.6363636363636364,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Calidris pusilla",
+          "n": 9,
+          "baseline_acc": 0.1111111111111111,
+          "pipeline_acc": 0.6666666666666666,
+          "baseline_top3_acc": 0.4444444444444444,
+          "pipeline_top3_acc": 0.8888888888888888
+        },
+        {
+          "species": "Chauna torquata",
+          "n": 5,
+          "baseline_acc": 0.6,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.6,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Columba livia",
+          "n": 30,
+          "baseline_acc": 0.5,
+          "pipeline_acc": 0.9333333333333333,
+          "baseline_top3_acc": 0.6333333333333333,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Heliornis fulica",
+          "n": 1,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Jabiru mycteria",
+          "n": 1,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Ortalis canicollis",
+          "n": 2,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Pipile jacutinga",
+          "n": 1,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Pluvialis dominica",
+          "n": 8,
+          "baseline_acc": 0.375,
+          "pipeline_acc": 0.75,
+          "baseline_top3_acc": 0.625,
+          "pipeline_top3_acc": 0.75
+        },
+        {
+          "species": "Pluvialis squatarola",
+          "n": 30,
+          "baseline_acc": 0.6,
+          "pipeline_acc": 0.6666666666666666,
+          "baseline_top3_acc": 0.8333333333333334,
+          "pipeline_top3_acc": 0.8
+        },
+        {
+          "species": "Ramphastos toco",
+          "n": 2,
+          "baseline_acc": 1.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 1.0,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Rhea americana",
+          "n": 4,
+          "baseline_acc": 0.0,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.25,
+          "pipeline_top3_acc": 1.0
+        },
+        {
+          "species": "Tringa flavipes",
+          "n": 15,
+          "baseline_acc": 0.4666666666666667,
+          "pipeline_acc": 0.7333333333333333,
+          "baseline_top3_acc": 0.9333333333333333,
+          "pipeline_top3_acc": 0.8666666666666667
+        },
+        {
+          "species": "Tringa melanoleuca",
+          "n": 13,
+          "baseline_acc": 0.38461538461538464,
+          "pipeline_acc": 1.0,
+          "baseline_top3_acc": 0.7692307692307693,
+          "pipeline_top3_acc": 1.0
+        }
+      ]
+    }
+  }
+}
