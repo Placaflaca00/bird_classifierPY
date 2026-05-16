@@ -50,6 +50,58 @@ MODEL_VERSION = "classifier_v1"  # bump en cada retrain; documentar en ADR
 
 DEFAULT_TOP_K = 3
 
+# Fase 2 - Nivel 2: gating OOD via clasificador nativo de BirdNET.
+# Sigmoid puro (no flat_sigmoid con sensitivity). Para gating binario
+# "pajaro/no pajaro" son equivalentes — divergen en ranking ENTRE especies,
+# que no nos importa (usamos ONNX para ese ranking).
+#
+# Threshold 0.10 (no 0.5 del paper original): Wood & Kahl 2024 (J. Ornithol.)
+# recomienda 0.5-0.7 para detection en monitoreo pasivo (audios largos, fauna
+# diversa, FP costosos). Nuestro caso es opuesto: audios cortos enviados por
+# usuarios humanos que YA decidieron que es un ave; el costo de FN ("no
+# detecte ave" sobre un ave real, peor UX) supera al de FP. Tuneo empirico
+# sobre el test set indica 0.10 como sweet spot (ver ADR D11).
+BIRDNET_DETECTION_THRESHOLD = 0.10
+
+# Fase 2 - Nivel 2 (capa pre-BirdNET): filtro espectral para rechazar audio
+# sinetico (white noise, tono puro) que BirdNET interpreta como ave generica
+# y pasa el gate de 0.10. Thresholds derivados empiricamente — ver
+# scripts/measure_flatness.py y ADR D11. Margenes amplios contra el peor
+# pajaro medido (~7x para flatness, ~2.7x para bandwidth).
+FLATNESS_WHITE_NOISE_P95 = 0.30  # p95 white noise = 0.59, max bird = 0.084
+WHITE_NOISE_MIN_RMS = 0.001       # excluye silencio puro (rms=0)
+FLATNESS_PURE_TONE_MEAN = 0.01    # tono puro = 0; aves tonales tambien ~0 pero las separa bw
+BANDWIDTH_PURE_TONE_HZ = 1000.0   # tono = 325 Hz; min bird bw = 2706 Hz (Actitis)
+
+# Filtro non-bird: clases de BirdNET V2.4 que NO son aves. Aplicado dentro de
+# `_embed()` antes del max-pool — sin esto, audios sin ave (ruido, voz humana,
+# rana) pueden disparar max_sigmoid alto sobre una meta-clase y pasar el
+# gate. Lista generada por inspeccion de las 6522 labels de V2.4 (script
+# scripts/benchmark_baseline_vs_finetuned.py:build_non_bird_mask). 18 idxs:
+# 12 meta-clases (Engine, Noise, Dog, Human-*, etc) + 6 ranas (generos Acris,
+# Eleutherodactylus, Hyliola, Lithobates). Si BirdNET actualiza el catalogo,
+# regenerar esta lista — los indices son posicionales del .txt de labels.
+_NON_BIRD_INDICES = frozenset([
+       50,  # Acris crepitans_Northern Cricket Frog
+       51,  # Acris gryllus_Southern Cricket Frog
+     1949,  # Dog_Dog
+     2080,  # Eleutherodactylus planirostris_Greenhouse Frog
+     2143,  # Engine_Engine
+     2152,  # Environmental_Environmental
+     2325,  # Fireworks_Fireworks
+     2818,  # Human non-vocal_Human non-vocal
+     2819,  # Human vocal_Human vocal
+     2820,  # Human whistle_Human whistle
+     2847,  # Hyliola regilla_Pacific Chorus Frog
+     3240,  # Lithobates catesbeianus_American Bullfrog
+     3241,  # Lithobates clamitans_Green Frog
+     3242,  # Lithobates palustris_Pickerel Frog
+     3243,  # Lithobates sylvaticus_Wood Frog
+     3927,  # Noise_Noise
+     4862,  # Power tools_Power tools
+     5560,  # Siren_Siren
+])
+
 
 # ---------------------------------------------------------------------------
 # Resolución de paths (Lambda image vs dev local)
@@ -107,7 +159,9 @@ def _load_birdnet():
     input_idx = interp.get_input_details()[0]["index"]
     classifier_out_idx = interp.get_output_details()[0]["index"]
     embedding_idx = classifier_out_idx - 1  # penúltima capa
-    return interp, input_idx, embedding_idx
+    # Retenemos classifier_out_idx para Nivel 2 (gating OOD). Hasta Fase 1
+    # lo descartabamos porque solo nos importaba el embedding.
+    return interp, input_idx, embedding_idx, classifier_out_idx
 
 
 def _load_classifier():
@@ -153,16 +207,71 @@ def _chunk_audio(y: np.ndarray) -> np.ndarray:
     return y[: n_windows * WINDOW_SAMPLES].reshape(n_windows, WINDOW_SAMPLES)
 
 
-def _embed(y: np.ndarray) -> tuple[np.ndarray, int]:
-    """Embedding 1024-d (mean-pool sobre ventanas) y n_windows usadas."""
-    interp, input_idx, emb_idx = _BIRDNET
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    """Sigmoid numericamente estable para logits de BirdNET.
+
+    BirdNET es multi-label: cada logit es independiente y necesita sigmoid
+    individual para que el threshold 0.5 sea interpretable como
+    'probabilidad de presencia' (Wood & Kahl 2024, J. Ornithol.).
+
+    Implementacion: casteo a float64 + clip a +-700 antes de exp(). El clip
+    es no-op para el rango real de BirdNET (~[-30, +15]) y garantiza que
+    no haya overflow para inputs sinteticos extremos (los limites de
+    np.exp() en float64 estan en ~+-709). Saturacion semanticamente
+    correcta: sigmoid(-1000) = 0, sigmoid(1000) = 1.
+    """
+    x = np.clip(x.astype(np.float64), -700.0, 700.0)
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _evaluate_detection(max_bird_conf_per_window: np.ndarray) -> tuple[float, bool]:
+    """Agrega confidences per-window y decide si hay deteccion.
+
+    Input: vector per-window de max-sigmoid YA filtrado por _NON_BIRD_INDICES
+    (las meta-clases y ranas fueron excluidas dentro de ``_embed``).
+
+    Returns (max_birdnet_confidence, detected).
+
+    Agregacion: MAX (no MEAN). BirdNET fue disenado para deteccion en 3 s.
+    Un audio "30 s con pajaro 5 s" + MEAN diluiria a ~0.10 (falso negativo);
+    MAX captura el peak. Mirrora la naturaleza puntual del modelo.
+    """
+    max_confidence = float(max_bird_conf_per_window.max())
+    return max_confidence, max_confidence >= BIRDNET_DETECTION_THRESHOLD
+
+
+def _embed(y: np.ndarray) -> tuple[np.ndarray, np.ndarray, int]:
+    """Devuelve (embedding mean-pool, max_bird_conf_per_window, n_windows).
+
+    Por ventana lee dos tensores ya computados por ``invoke()``:
+      - ``emb_idx``: embedding 1024-d (penultima capa).
+      - ``cls_idx``: logits del clasificador nativo (~6522 especies BirdNET).
+
+    Aplica filtro bird-only sobre los logits antes del max-pool: las clases
+    en ``_NON_BIRD_INDICES`` (ruido, voz humana, ranas, etc.) se setean a
+    -inf, asi NUNCA pueden disparar la deteccion. Esto se hace ACA y no en
+    ``_evaluate_detection`` porque solo aca tenemos los logits raw — pasar
+    el vector completo per-window al evaluador seria duplicar memoria y
+    contaminar la signature del decisor.
+
+    Costo extra vs Nivel 1: lectura de ~6522 floats + sigmoid + mask + max
+    por ventana. El ``invoke()`` ya computa ambos tensores — no hay forward
+    adicional.
+    """
+    interp, input_idx, emb_idx, cls_idx = _BIRDNET
     windows = _chunk_audio(y).astype(np.float32)
     embs = np.empty((len(windows), EMBEDDING_DIM), dtype=np.float32)
+    max_bird_conf_per_window = np.empty(len(windows), dtype=np.float64)
+    non_bird_idx_arr = np.fromiter(_NON_BIRD_INDICES, dtype=np.int64)
     for k, w in enumerate(windows):
         interp.set_tensor(input_idx, np.expand_dims(w, axis=0))
         interp.invoke()
         embs[k] = interp.get_tensor(emb_idx)[0]
-    return embs.mean(axis=0), len(windows)
+        logits = interp.get_tensor(cls_idx)[0]  # shape: (~6522,)
+        probs = _sigmoid(logits)
+        probs[non_bird_idx_arr] = -np.inf  # excluir non-bird del max
+        max_bird_conf_per_window[k] = probs.max()
+    return embs.mean(axis=0), max_bird_conf_per_window, len(windows)
 
 
 def _classify(embedding: np.ndarray, top_k: int) -> list[dict[str, Any]]:
@@ -194,6 +303,47 @@ def _load_audio_bytes(audio_bytes: bytes) -> np.ndarray:
     if len(y) == 0:
         raise ValueError("audio vacío después de decodificar")
     return y.astype(np.float32)
+
+
+def _classify_synthetic(y: np.ndarray) -> str | None:
+    """Pre-filter espectral: detecta audio sintetico que BirdNET interpreta
+    como ave (white noise plano, tono puro).
+
+    Devuelve:
+        "white_noise" si spectral flatness p95 > 0.30 y rms > 0.001
+        "pure_tone"   si spectral flatness mean < 0.01 y bandwidth mean < 1000 Hz
+        None          si parece audio natural — sigue al gate de BirdNET
+
+    Logica:
+      - Flatness (Wiener entropy): ratio gmean/amean del power spectrum.
+        Cercano a 1 = ruido blanco. Cercano a 0 = senal armonica
+        concentrada (tono puro, vocalizacion clara).
+      - Bandwidth: ancho efectivo alrededor del centroide espectral.
+        Tonos puros tienen bandwidth chico (~300 Hz); aves tonales
+        igual tienen flat bajo pero su bandwidth es 1 orden de magnitud
+        mayor por harmonics + transients.
+      - RMS energy: para no confundir silencio puro (flatness alta por
+        division por cero) con white noise.
+
+    Costo: ~5-10 ms para audio de 5 s. Ahorra ~120-150 ms de BirdNET cuando
+    rechaza. Net positivo si los rejects son frecuentes.
+    """
+    import librosa
+
+    flat = librosa.feature.spectral_flatness(y=y)[0]
+    rms = librosa.feature.rms(y=y)[0]
+
+    if float(np.percentile(flat, 95)) > FLATNESS_WHITE_NOISE_P95 \
+            and float(rms.mean()) > WHITE_NOISE_MIN_RMS:
+        return "white_noise"
+
+    flat_mean = float(flat.mean())
+    if flat_mean < FLATNESS_PURE_TONE_MEAN:
+        bw = librosa.feature.spectral_bandwidth(y=y, sr=SAMPLE_RATE)[0]
+        if float(bw.mean()) < BANDWIDTH_PURE_TONE_HZ:
+            return "pure_tone"
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -264,18 +414,50 @@ def handler(event: dict, context: Any = None) -> dict:
         return _response(400, {"error": f"no se pudo decodificar audio: {e}"})
 
     t0 = time.perf_counter()
+
+    # Capa 1 (pre-BirdNET): rechazo de audio sintetico. Ahorra invoke a BirdNET.
     try:
-        embedding, n_windows = _embed(y)
-        predictions = _classify(embedding, top_k)
+        synthetic_reason = _classify_synthetic(y)
+    except Exception as e:
+        return _response(500, {"error": f"pre-filter falló: {type(e).__name__}: {e}"})
+    if synthetic_reason is not None:
+        inference_ms = (time.perf_counter() - t0) * 1000.0
+        return _response(200, {
+            "detected": False,
+            "reason": synthetic_reason,
+            "model_version": MODEL_VERSION,
+            "inference_time_ms": round(inference_ms, 2),
+        })
+
+    # Capa 2 (BirdNET native gate) + Capa 3 (ONNX classifier).
+    try:
+        embedding, max_conf_per_window, n_windows = _embed(y)
+        max_birdnet_confidence, detected = _evaluate_detection(max_conf_per_window)
+        predictions = _classify(embedding, top_k) if detected else None
     except Exception as e:
         return _response(500, {"error": f"inferencia falló: {type(e).__name__}: {e}"})
     inference_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Fase 2 - Nivel 2: gating OOD. Si BirdNET nativo no detecto ave,
+    # devolvemos status 200 con detected=false en vez de predictions.
+    # max_birdnet_confidence se loguea SIEMPRE (gated y happy path) para
+    # tener distribucion empirica y poder tunear el threshold con datos.
+    if not detected:
+        return _response(200, {
+            "detected": False,
+            "reason": "not_a_bird",
+            "max_birdnet_confidence": round(max_birdnet_confidence, 4),
+            "model_version": MODEL_VERSION,
+            "n_windows": n_windows,
+            "inference_time_ms": round(inference_ms, 2),
+        })
 
     return _response(200, {
         "predictions": predictions,
         "model_version": MODEL_VERSION,
         "n_windows": n_windows,
         "inference_time_ms": round(inference_ms, 2),
+        "max_birdnet_confidence": round(max_birdnet_confidence, 4),
     })
 
 
