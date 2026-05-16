@@ -85,6 +85,10 @@ class PredictResult:
     Objeto único para que la UI tenga un solo code path: si ``ok`` es False,
     ``error_kind`` / ``error_message`` explican qué pasó. ``predict()`` nunca
     lanza por errores de red o HTTP.
+
+    Si ``ok`` es True y ``detected`` es False, el backend gating decidio que
+    el audio no es ave: ``reject_reason`` indica por que. La UI muestra
+    mensaje especifico, no error.
     """
 
     ok: bool
@@ -92,6 +96,14 @@ class PredictResult:
     model_version: str | None = None
     n_windows: int | None = None
     inference_time_ms: float | None = None
+    # Fase 2 - Nivel 2: gating del backend. detected=True implica
+    # predictions presentes (happy path). detected=False implica gating
+    # rechazo: reject_reason in {"not_a_bird","white_noise","pure_tone"}.
+    # Default True para retrocompat con Lambda Fase 1 (que no devuelve
+    # la key "detected" — el flag default cubre ese caso transparente).
+    detected: bool = True
+    reject_reason: str | None = None
+    max_birdnet_confidence: float | None = None
     # "throttled" | "timeout" | "server" | "bad_request"
     #   | "network" | "bad_response" | "config"
     error_kind: str | None = None
@@ -186,7 +198,33 @@ def _map_response(resp: requests.Response) -> PredictResult:
                 ok=False, error_kind="bad_response",
                 error_message="la respuesta del servidor no es JSON válido",
             )
-        if not isinstance(data, dict) or not isinstance(data.get("predictions"), list):
+        if not isinstance(data, dict):
+            return PredictResult(
+                ok=False, error_kind="bad_response",
+                error_message="la respuesta no tiene el campo 'predictions'",
+            )
+
+        # Fase 2 - Nivel 2 — gating del backend: "no detecte ave".
+        # El handler omite "predictions" en este caso. NO es bad_response:
+        # es decision legitima del gate (reason in {not_a_bird, white_noise,
+        # pure_tone}). Retrocompat con Lambda vieja: si la key "detected" no
+        # esta presente, este branch no se activa y caemos al path happy.
+        if data.get("detected") is False:
+            return PredictResult(
+                ok=True,
+                detected=False,
+                reject_reason=data.get("reason"),
+                max_birdnet_confidence=data.get("max_birdnet_confidence"),
+                model_version=data.get("model_version"),
+                n_windows=data.get("n_windows"),
+                inference_time_ms=data.get("inference_time_ms"),
+            )
+
+        # Happy path: predicciones presentes. Cubre handler nuevo
+        # (detected=True implicito ya que la key existe pero es True) y
+        # handler viejo Fase 1 (sin key "detected" — default detected=True
+        # del dataclass aplica).
+        if not isinstance(data.get("predictions"), list):
             return PredictResult(
                 ok=False, error_kind="bad_response",
                 error_message="la respuesta no tiene el campo 'predictions'",
@@ -197,6 +235,7 @@ def _map_response(resp: requests.Response) -> PredictResult:
             model_version=data.get("model_version"),
             n_windows=data.get("n_windows"),
             inference_time_ms=data.get("inference_time_ms"),
+            max_birdnet_confidence=data.get("max_birdnet_confidence"),
         )
 
     detail = _extract_error_detail(resp)

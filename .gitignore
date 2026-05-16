@@ -195,5 +195,14 @@ scratch/
 tmp/
 .lambda-setup/
 
+# Audios personales de fixtures (regenerables; los sinteticos si van al repo)
+tests/fixtures/voz_humana_*
+tests/fixtures/ambiente.*
+
+# Logs de runs de benchmark (resultados JSON/MD/CSV si van; logs no)
+benchmarks/*.log
+
+# Auto-memory del agent NO va al repo (vive en ~/.claude/projects/<slug>/memory/)
+/memory/
 
 .claude/*
