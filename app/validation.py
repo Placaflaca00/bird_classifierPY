@@ -133,7 +133,11 @@ def validate_audio(path: str | Path) -> ValidationResult:
         6. channels en [1, MAX_CHANNELS].
 
     Nunca lanza: cualquier excepcion de mutagen se mapea a ``unreadable``.
+    Acepta ``None`` / "" sin crashear (defensa secundaria; la state machine
+    UI ya garantiza path no-vacio).
     """
+    if not path:
+        return _fail("unreadable", reason="empty_path")
     p = Path(path)
 
     # 1a: existe.

@@ -159,6 +159,54 @@ def _build_details(top: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# State machine UI (Fase 2 - Nivel 1 UX)
+# ---------------------------------------------------------------------------
+# Cuatro estados gobiernan el par (boton submit, hint debajo del audio):
+#
+#   IDLE        — sin audio cargado. Submit disabled. Hint pide audio.
+#   RECORDING   — usuario grabando con mic. Submit disabled. Hint avisa.
+#   READY       — hay audio + no se esta grabando + no se esta clasificando.
+#                 Submit enabled. Hint vacio.
+#   PROCESSING  — classify() en curso. Submit disabled. Hint avisa.
+#
+# Eventos que disparan transiciones:
+#   audio_in.start_recording  -> RECORDING (override de cualquier estado)
+#   audio_in.change           -> READY si hay value, IDLE si no
+#                                (cubre upload, clear, y stop_recording)
+#   submit.click chain:       READY -> PROCESSING -> (READY | IDLE segun audio)
+#
+# El boton arranca disabled (IDLE) en el constructor. Prevention > recovery:
+# es preferible que el usuario no pueda clickear en momento invalido a tener
+# que manejarlo en classify().
+
+_HINT_IDLE = "Subi o graba un audio primero."
+_HINT_RECORDING = "Grabando... terminá la grabación para clasificar."
+_HINT_PROCESSING = "Clasificando..."
+_HINT_READY = ""
+
+
+def _state_idle() -> tuple:
+    return gr.update(interactive=False), gr.update(value=_HINT_IDLE)
+
+
+def _state_recording() -> tuple:
+    return gr.update(interactive=False), gr.update(value=_HINT_RECORDING)
+
+
+def _state_ready() -> tuple:
+    return gr.update(interactive=True), gr.update(value=_HINT_READY)
+
+
+def _state_processing() -> tuple:
+    return gr.update(interactive=False), gr.update(value=_HINT_PROCESSING)
+
+
+def _on_audio_change(audio_path: str | None) -> tuple:
+    """audio_in.change: READY si hay audio, IDLE si no."""
+    return _state_ready() if audio_path else _state_idle()
+
+
+# ---------------------------------------------------------------------------
 # Callback del clasificador
 # ---------------------------------------------------------------------------
 def _hidden_result() -> tuple:
@@ -187,15 +235,13 @@ def classify(audio_path: str | None):
     En CUALQUIER caso de error: el panel de resultado queda oculto y sus
     campos limpios; solo el error_box muestra el mensaje. Asi no queda un
     estado mixto (foto vieja arriba + error abajo).
-    """
-    if not audio_path:
-        hidden = _hidden_result()
-        return (
-            hidden[0],
-            gr.update(visible=True, value="Sube o graba un audio primero."),
-            hidden[1], hidden[2], hidden[3],
-        )
 
+    Precondicion garantizada por la state machine UI: ``audio_path`` nunca
+    es None ni vacio cuando este callback se invoca (el boton arranca
+    disabled y solo se habilita en estado READY). Si llegara None de todas
+    formas (bug en el wiring), ``validate_audio`` lo mapea a "unreadable"
+    sin crashear.
+    """
     # Fase 2 - Nivel 1: validacion inline antes de invocar la Lambda.
     # Si falla, ahorramos cold start y devolvemos un mensaje especifico.
     validation = validate_audio(audio_path)
@@ -407,7 +453,15 @@ _CSS = (
     padding: 6px 0 0 0;
 }
 .classify-btn {
-    margin-top: 10px;
+    margin-top: 4px;
+}
+.status-hint {
+    text-align: center;
+    color: {{TEXT_DIM}};
+    font-size: 0.88em;
+    font-style: italic;
+    margin: 6px 0 2px 0;
+    min-height: 1.3em;  /* reserva altura para que el layout no salte cuando esta vacio */
 }
 .error-box {
     background: #5a3a3a !important;
@@ -525,10 +579,16 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                     label="Audio del ave",
                     show_label=True,
                 )
+                # State machine UI: hint debajo del audio + boton que arranca
+                # disabled. Solo se habilita cuando hay audio cargado.
+                status_hint = gr.Markdown(
+                    value=_HINT_IDLE, elem_classes="status-hint"
+                )
                 submit = gr.Button(
                     "Clasificar",
                     variant="primary",
                     size="lg",
+                    interactive=False,
                     elem_classes="classify-btn",
                 )
 
@@ -550,10 +610,42 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                     num_top_classes=TOP_K, label="Top 3 predicciones"
                 )
 
+            # ---- State machine wiring (Fase 2 - Nivel 1 UX) -----------------
+            # IDLE inicial: el boton ya arranca con interactive=False y el hint
+            # con _HINT_IDLE. No hace falta evento de "load" para setearlo.
+
+            # IDLE/READY -> RECORDING: arranca grabacion de mic.
+            audio_in.start_recording(
+                fn=_state_recording,
+                inputs=None,
+                outputs=[submit, status_hint],
+            )
+
+            # Cubre: upload completo, stop_recording (con audio listo), y clear.
+            # Por eso NO wireamos stop_recording por separado — change fires
+            # despues con el value materializado, evitando race.
+            audio_in.change(
+                fn=_on_audio_change,
+                inputs=audio_in,
+                outputs=[submit, status_hint],
+            )
+
+            # READY -> PROCESSING -> (READY|IDLE). El primer .then() bloquea el
+            # boton ANTES de que classify arranque, asi un doble-click se
+            # serializa visualmente (no solo en queue de Gradio). El segundo
+            # .then() recalcula el estado mirando el audio actual.
             submit.click(
+                fn=_state_processing,
+                inputs=None,
+                outputs=[submit, status_hint],
+            ).then(
                 fn=classify,
                 inputs=audio_in,
                 outputs=[result_group, error_box, bird_photo, bird_info, label_out],
+            ).then(
+                fn=_on_audio_change,
+                inputs=audio_in,
+                outputs=[submit, status_hint],
             )
 
         # ----- Tab 2: Las 20 aves -----
