@@ -1,14 +1,18 @@
-"""Frontend Gradio para HuggingFace Spaces.
+"""Frontend Gradio para HuggingFace Spaces — conocetuave.com.py.
 
-``gr.Blocks`` que toma un audio, lo manda a /predict vía ``client.predict()`` y
-renderiza top-3 + ficha de la especie más probable.
+``gr.Blocks`` con tema "bosque calido" (verde pastel) y dos tabs:
 
-Alcance v0 (esta fase): solo predicción. Sin flagging (Fase 4), sin validación
-formal del input (fase posterior). Único filtro acá: aviso inline de baja
-confianza cuando el top-1 < 0.5.
+- **Clasificar**: el flujo principal. Audio in -> /predict -> panel con foto +
+  ficha del top-1 + top-3.
+- **Las 20 aves**: galeria estatica con las especies que el modelo conoce.
 
-No depende de ``src/`` — en HF Spaces este archivo y ``client.py`` van al root
-del Space, así que el import es directo (sibling).
+Sub-fase A del rediseno: estructura visual lista; el contenido (fotos en
+``assets/birds/`` y descripciones en ``species_info.json``) se llena despues
+sin tocar el codigo. Si una foto no existe en disco, el componente se oculta
+en lugar de mostrar un broken image; si una descripcion esta vacia, se omite.
+
+Alcance: solo predicir. Sin flagging (Fase 4), sin validacion formal de input
+(fase posterior). Unico filtro inline: aviso si top-1 < 0.5.
 
 Test local (exportar la URL primero, igual que client.py):
     $env:API_GATEWAY_URL = "https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/predict"
@@ -16,51 +20,112 @@ Test local (exportar la URL primero, igual que client.py):
 """
 from __future__ import annotations
 
+import html as html_mod
+import json
+from pathlib import Path
+
 import gradio as gr
 
 from client import predict
 
+# ---------------------------------------------------------------------------
+# Constantes
+# ---------------------------------------------------------------------------
+APP_TITLE = "Conoce Tu Ave Py"
+APP_SUBTITLE = "Clasificador de aves de Paraguay"
 TOP_K = 3
 LOW_CONFIDENCE_THRESHOLD = 0.5
+
+HERE = Path(__file__).resolve().parent
+ASSETS_DIR = HERE / "assets"
+LOGO_PATH = ASSETS_DIR / "logo.png"
+SPECIES_INFO_PATH = HERE / "species_info.json"
+
+# Paleta "bosque calido" — verde oliva, sensacion organica.
+BG_DEEP = "#2f3a28"      # fondo de la pagina
+BG_CARD = "#3d4933"      # bloques / paneles
+PRIMARY = "#5a7d4a"      # botones, links
+SECONDARY = "#b8d4a8"    # highlights, acentos
+TEXT = "#ecf0e4"
+TEXT_DIM = "#c0c8b8"
 
 # error_kind (de client.PredictResult) -> mensaje user-facing.
 _ERROR_MESSAGES = {
     "throttled": (
-        "El servicio está recibiendo muchas solicitudes. Esperá unos segundos "
-        "y probá de nuevo."
+        "El servicio esta recibiendo muchas solicitudes. Espera unos segundos "
+        "y proba de nuevo."
     ),
     "timeout": (
-        "El servidor tardó demasiado en responder. Puede ser un audio muy "
-        "largo, o el servidor recién despertando — probá de nuevo."
+        "El servidor tardo demasiado en responder. Puede ser un audio muy "
+        "largo, o el servidor recien despertando — proba de nuevo."
     ),
     "network": (
-        "No se pudo conectar con el servidor. Revisá tu conexión y probá de "
+        "No se pudo conectar con el servidor. Revisa tu conexion y proba de "
         "nuevo."
     ),
-    "server": "Error interno del servidor. Probá de nuevo en un rato.",
+    "server": "Error interno del servidor. Proba de nuevo en un rato.",
     "bad_response": (
-        "El servidor respondió algo inesperado. Probá de nuevo en un rato."
+        "El servidor respondio algo inesperado. Proba de nuevo en un rato."
     ),
     "config": (
-        "El servicio está mal configurado (es un problema nuestro, no de tu "
-        "audio). Avisá al administrador."
+        "El servicio esta mal configurado (es un problema nuestro, no de tu "
+        "audio). Avisa al administrador."
     ),
 }
 
 
-def _format_species_key(pred: dict) -> str:
-    """Clave para gr.Label: 'Común (Científico)'.
+# ---------------------------------------------------------------------------
+# Carga module-level de species_info
+# ---------------------------------------------------------------------------
+def _load_species_info() -> dict[str, dict]:
+    """species_info.json -> {species_sci: {es, en, description, photo}}. {} si falla."""
+    try:
+        with open(SPECIES_INFO_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("species", {}) or {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
-    El nombre científico siempre está => la clave es única. Si no hay nombre
-    común, queda solo el científico.
-    """
+
+_SPECIES_INFO = _load_species_info()
+
+
+# ---------------------------------------------------------------------------
+# Helpers de presentacion
+# ---------------------------------------------------------------------------
+def _format_species_key(pred: dict) -> str:
+    """Clave para gr.Label: 'Comun (Cientifico)'. Cientifico siempre presente => unica."""
     species = pred.get("species") or "especie desconocida"
     common = pred.get("common_name")
     return f"{common} ({species})" if common else species
 
 
+def _resolve_bird_photo(species: str) -> str | None:
+    """Path absoluto de la foto si existe en disco, None si no."""
+    info = _SPECIES_INFO.get(species)
+    if not info:
+        return None
+    rel = info.get("photo") or ""
+    if not rel:
+        return None
+    abspath = HERE / rel
+    return str(abspath) if abspath.exists() else None
+
+
+def _photo_credit_html(info: dict) -> str:
+    """HTML chico con el credito + licencia de la foto, o '' si no hay credito.
+
+    La atribucion es legalmente requerida para fotos CC-BY*. El texto viene
+    formateado tal cual iNaturalist lo provee.
+    """
+    credit = (info.get("photo_credit") or "").strip()
+    if not credit:
+        return ""
+    return f'<div class="photo-credit">Foto: {credit}</div>'
+
+
 def _build_details(top: dict) -> str:
-    """Ficha markdown del top-1, con aviso de baja confianza si corresponde."""
+    """Ficha markdown del top-1 con aviso de baja confianza si corresponde."""
     species = top.get("species") or "especie desconocida"
     common = top.get("common_name") or species
     common_en = top.get("common_name_en")
@@ -70,89 +135,426 @@ def _build_details(top: dict) -> str:
     parts: list[str] = []
     if isinstance(conf, (int, float)) and conf < LOW_CONFIDENCE_THRESHOLD:
         parts.append(
-            f"**Aviso — confianza baja ({conf_pct}).** El modelo no está "
-            "seguro. El audio puede tener mucho ruido, no contener un ave, o "
-            "ser de una especie fuera de las que el modelo conoce. Tomá el "
-            "resultado con pinzas."
+            f"**Confianza baja ({conf_pct}).** El modelo no esta seguro. "
+            "El audio puede tener ruido, no contener un ave, o ser de una "
+            "especie fuera de las 20 que conoce."
         )
 
-    ficha = [
-        f"**Especie más probable:** {common} (*{species}*)",
-        f"- Confianza: {conf_pct}",
-    ]
+    ficha = [f"### {common}", f"*{species}*", "", f"**Confianza:** {conf_pct}"]
     if common_en:
-        ficha.append(f"- Nombre común (EN): {common_en}")
+        ficha.append(f"**En ingles:** {common_en}")
+
+    info = _SPECIES_INFO.get(species, {})
+    desc = (info.get("description") or "").strip()
+    if desc:
+        ficha.extend(["", desc])
+
+    credit_html = _photo_credit_html(info)
+    if credit_html:
+        ficha.extend(["", credit_html])
+
     parts.append("\n".join(ficha))
     return "\n\n".join(parts)
 
 
-def classify(audio_path: str | None):
-    """Callback del botón. Devuelve (valor para gr.Label, markdown de detalle).
+# ---------------------------------------------------------------------------
+# Callback del clasificador
+# ---------------------------------------------------------------------------
+def _hidden_result() -> tuple:
+    """Tupla de updates que oculta el panel de resultado y limpia sus campos.
 
-    En cualquier caso de error devuelve ``gr.update(value=None)`` para el Label:
-    limpia lo que hubiera de una clasificación anterior, así no queda un estado
-    inconsistente (predicción vieja arriba, error abajo). ``gr.update(value=None)``
-    es la forma confiable de resetear el componente.
+    Outputs: (result_group, bird_photo, bird_info, label_out)
+    """
+    return (
+        gr.update(visible=False),
+        gr.update(value=None),
+        gr.update(value=""),
+        gr.update(value=None),
+    )
+
+
+def classify(audio_path: str | None):
+    """Callback del boton Clasificar.
+
+    Outputs (orden importa, matchea el .click() abajo):
+        0. result_group   -> visible True/False
+        1. error_box      -> visible + value (texto del error o vacio)
+        2. bird_photo     -> Image, path o None
+        3. bird_info      -> Markdown con ficha
+        4. label_out      -> dict {label: prob} para gr.Label
+
+    En CUALQUIER caso de error: el panel de resultado queda oculto y sus
+    campos limpios; solo el error_box muestra el mensaje. Asi no queda un
+    estado mixto (foto vieja arriba + error abajo).
     """
     if not audio_path:
-        return gr.update(value=None), "Subí o grabá un audio primero."
+        hidden = _hidden_result()
+        return (
+            hidden[0],
+            gr.update(visible=True, value="Sube o graba un audio primero."),
+            hidden[1], hidden[2], hidden[3],
+        )
 
     result = predict(audio_path, top_k=TOP_K)
 
     if not result.ok:
         if result.error_kind == "bad_request":
-            # El detalle del backend ('Format not recognised', etc.) ayuda al
-            # usuario a entender qué pasó con su archivo.
             detail = result.error_message or "el archivo no pudo procesarse"
             msg = (
                 f"No se pudo procesar el audio: {detail}. "
-                "Probá con otro archivo (mp3 o wav, que contenga sonido)."
+                "Proba con otro archivo (mp3 o wav, que contenga sonido)."
             )
         else:
             msg = _ERROR_MESSAGES.get(
-                result.error_kind, "Ocurrió un error inesperado."
+                result.error_kind, "Ocurrio un error inesperado."
             )
-        return gr.update(value=None), msg
+        hidden = _hidden_result()
+        return (
+            hidden[0],
+            gr.update(visible=True, value=msg),
+            hidden[1], hidden[2], hidden[3],
+        )
 
     if not result.predictions:
-        return gr.update(value=None), "El servidor no devolvió ninguna predicción."
+        hidden = _hidden_result()
+        return (
+            hidden[0],
+            gr.update(visible=True, value="El servidor no devolvio predicciones."),
+            hidden[1], hidden[2], hidden[3],
+        )
 
-    label = {
+    top1 = result.predictions[0]
+    species = top1.get("species") or ""
+    photo = _resolve_bird_photo(species)
+    info_md = _build_details(top1)
+    labels = {
         _format_species_key(p): float(p.get("confidence") or 0.0)
         for p in result.predictions
     }
-    details = _build_details(result.predictions[0])
-    return label, details
+
+    return (
+        gr.update(visible=True),                  # result_group
+        gr.update(visible=False, value=""),       # error_box
+        gr.update(value=photo, visible=photo is not None),  # bird_photo
+        info_md,                                  # bird_info
+        labels,                                   # label_out
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tab 2 — galeria de las 20 aves
+# ---------------------------------------------------------------------------
+def _render_species_gallery_html() -> str:
+    """Tab 2 entero como UN solo string HTML.
+
+    Reemplaza los 20 pares (gr.Image + gr.Markdown) anteriores por cards puras
+    HTML. Beneficios:
+    - HTML inicial ~30 KB en vez de ~130 KB (cada gr.Image inflaba el payload).
+    - `loading="lazy"` difiere la descarga de cada foto hasta que esta cerca
+      del viewport. Si el usuario no abre tab 2, las fotos NUNCA se descargan.
+    """
+    cards: list[str] = []
+    for species, info in sorted(_SPECIES_INFO.items()):
+        photo_path = _resolve_bird_photo(species)
+        common = info.get("es") or species
+        en = info.get("en") or ""
+        desc = (info.get("description") or "").strip()
+        credit = (info.get("photo_credit") or "").strip()
+
+        img_html = ""
+        if photo_path:
+            # Forward slashes para que la URL no rompa en Windows.
+            url = "/gradio_api/file=" + str(photo_path).replace("\\", "/")
+            alt = html_mod.escape(common)
+            img_html = (
+                '<div class="bird-card-img">'
+                f'<img src="{url}" loading="lazy" decoding="async" alt="{alt}">'
+                "</div>"
+            )
+
+        body_parts = [
+            f'<div class="bird-card-name">{html_mod.escape(common)}</div>',
+            f'<div class="bird-card-sci">{html_mod.escape(species)}</div>',
+        ]
+        if en:
+            body_parts.append(
+                f'<div class="bird-card-en">{html_mod.escape(en)}</div>'
+            )
+        if desc:
+            body_parts.append(
+                f'<div class="bird-card-desc">{html_mod.escape(desc)}</div>'
+            )
+        else:
+            body_parts.append(
+                '<div class="bird-card-desc"><em>contenido proximamente</em></div>'
+            )
+        if credit:
+            body_parts.append(
+                f'<div class="photo-credit">Foto: {html_mod.escape(credit)}</div>'
+            )
+
+        body = '<div class="bird-card-body">' + "".join(body_parts) + "</div>"
+        cards.append(f'<div class="bird-card-html">{img_html}{body}</div>')
+
+    return '<div class="bird-grid">' + "".join(cards) + "</div>"
+
+
+# ---------------------------------------------------------------------------
+# Tema "bosque calido"
+# ---------------------------------------------------------------------------
+def _build_theme() -> gr.themes.Base:
+    """gr.themes.Soft tunneado a la paleta verde oliva."""
+    theme = gr.themes.Soft(
+        primary_hue="green",
+        secondary_hue="green",
+        neutral_hue="stone",
+    ).set(
+        body_background_fill=BG_DEEP,
+        body_background_fill_dark=BG_DEEP,
+        body_text_color=TEXT,
+        body_text_color_dark=TEXT,
+        body_text_color_subdued=TEXT_DIM,
+        body_text_color_subdued_dark=TEXT_DIM,
+        background_fill_primary=BG_CARD,
+        background_fill_primary_dark=BG_CARD,
+        background_fill_secondary=BG_DEEP,
+        background_fill_secondary_dark=BG_DEEP,
+        block_background_fill=BG_CARD,
+        block_background_fill_dark=BG_CARD,
+        block_border_color=PRIMARY,
+        block_border_color_dark=PRIMARY,
+        block_label_text_color=SECONDARY,
+        block_label_text_color_dark=SECONDARY,
+        block_title_text_color=SECONDARY,
+        block_title_text_color_dark=SECONDARY,
+        button_primary_background_fill=PRIMARY,
+        button_primary_background_fill_dark=PRIMARY,
+        button_primary_background_fill_hover="#6f9059",
+        button_primary_background_fill_hover_dark="#6f9059",
+        button_primary_text_color="#ffffff",
+        button_primary_text_color_dark="#ffffff",
+        color_accent=SECONDARY,
+        color_accent_soft="#4c5d40",
+        color_accent_soft_dark="#4c5d40",
+        border_color_primary=PRIMARY,
+        border_color_primary_dark=PRIMARY,
+        panel_background_fill=BG_CARD,
+        panel_background_fill_dark=BG_CARD,
+    )
+    return theme
+
+
+# ---------------------------------------------------------------------------
+# CSS custom
+# ---------------------------------------------------------------------------
+# Usamos placeholders {{TOKEN}} + .replace() en vez de % formatting porque el
+# CSS tiene chars % literales (max-width: 100%) que rompen el formatter.
+_CSS = (
+    """
+.app-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    padding: 18px 0 18px 0;
+    flex-wrap: wrap;
+}
+.app-header img {
+    height: 180px;
+    width: auto;
+    max-width: 100%;
+}
+.app-header-text {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+}
+.app-title {
+    font-size: 2.6em;
+    font-weight: 700;
+    color: {{SECONDARY}};
+    margin: 0;
+    letter-spacing: 0.5px;
+    line-height: 1.1;
+}
+.app-subtitle {
+    color: {{TEXT_DIM}};
+    margin: 6px 0 0 0;
+    font-size: 1em;
+}
+.cold-note {
+    text-align: center;
+    color: {{TEXT_DIM}};
+    font-size: 0.82em;
+    margin-bottom: 14px;
+    font-style: italic;
+}
+.audio-block {
+    padding: 6px 0 0 0;
+}
+.classify-btn {
+    margin-top: 10px;
+}
+.error-box {
+    background: #5a3a3a !important;
+    border: 1px solid #a06060 !important;
+    border-radius: 8px;
+    padding: 10px 14px !important;
+    color: #f5dada !important;
+}
+.bird-card {
+    padding: 10px;
+    border-radius: 10px;
+    background: {{BG_CARD}};
+}
+.photo-credit {
+    font-size: 0.72em;
+    color: {{TEXT_DIM}};
+    margin-top: 6px;
+    opacity: 0.75;
+    line-height: 1.35;
+}
+.bird-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 14px;
+    margin-top: 12px;
+}
+.bird-card-html {
+    background: {{BG_CARD}};
+    border-radius: 10px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+.bird-card-img {
+    width: 100%;
+    height: 160px;
+    overflow: hidden;
+    background: rgba(0,0,0,0.15);
+}
+.bird-card-img img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.bird-card-body {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+}
+.bird-card-name {
+    font-weight: 600;
+    color: {{SECONDARY}};
+    margin-bottom: 2px;
+}
+.bird-card-sci {
+    font-style: italic;
+    font-size: 0.85em;
+    color: {{TEXT_DIM}};
+    margin-bottom: 2px;
+}
+.bird-card-en {
+    font-size: 0.78em;
+    color: {{TEXT_DIM}};
+    margin-bottom: 6px;
+    opacity: 0.85;
+}
+.bird-card-desc {
+    font-size: 0.85em;
+    line-height: 1.4;
+    margin-bottom: 6px;
+}
+"""
+    .replace("{{SECONDARY}}", SECONDARY)
+    .replace("{{TEXT_DIM}}", TEXT_DIM)
+    .replace("{{BG_CARD}}", BG_CARD)
+)
 
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-_DESCRIPTION = (
-    "Subí o grabá un audio de un ave de Paraguay y el modelo te dice las 3 "
-    "especies más probables.\n\n"
-    "_Nota: la primera consulta puede tardar ~30 s mientras el servidor "
-    "despierta (cold start). Las siguientes son casi instantáneas._"
-)
+def _header_html() -> str:
+    """Header con logo (si existe) al lado de titulo + subtitulo en columna."""
+    logo_tag = ""
+    if LOGO_PATH.exists():
+        logo_tag = f'<img src="/gradio_api/file={LOGO_PATH}" alt="logo" />'
+    return (
+        '<div class="app-header">'
+        f"{logo_tag}"
+        '<div class="app-header-text">'
+        f'<h1 class="app-title">{APP_TITLE}</h1>'
+        f'<p class="app-subtitle">{APP_SUBTITLE}</p>'
+        "</div>"
+        "</div>"
+    )
 
-with gr.Blocks(title="Clasificador de aves de Paraguay") as demo:
-    gr.Markdown("# Clasificador de aves de Paraguay")
-    gr.Markdown(_DESCRIPTION)
 
-    with gr.Row():
-        with gr.Column():
-            audio_in = gr.Audio(
-                type="filepath",
-                sources=["upload", "microphone"],
-                label="Audio del ave",
+with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
+    gr.HTML(_header_html())
+
+    with gr.Tabs():
+        # ----- Tab 1: Clasificar -----
+        with gr.Tab("Clasificar"):
+            gr.HTML(
+                '<p class="cold-note">La primera consulta puede tardar ~30 s '
+                "mientras el servidor despierta. Las siguientes son casi "
+                "instantaneas.</p>"
             )
-            submit = gr.Button("Clasificar", variant="primary")
-        with gr.Column():
-            label_out = gr.Label(num_top_classes=TOP_K, label="Predicción (top 3)")
-            details_out = gr.Markdown()
 
-    submit.click(fn=classify, inputs=audio_in, outputs=[label_out, details_out])
+            with gr.Column(elem_classes="audio-block"):
+                audio_in = gr.Audio(
+                    type="filepath",
+                    sources=["upload", "microphone"],
+                    label="Audio del ave",
+                    show_label=True,
+                )
+                submit = gr.Button(
+                    "Clasificar",
+                    variant="primary",
+                    size="lg",
+                    elem_classes="classify-btn",
+                )
+
+            error_box = gr.Markdown(
+                value="", visible=False, elem_classes="error-box"
+            )
+
+            with gr.Group(visible=False) as result_group:
+                with gr.Row():
+                    bird_photo = gr.Image(
+                        label=None,
+                        show_label=False,
+                        interactive=False,
+                        visible=False,
+                        height=240,
+                    )
+                    bird_info = gr.Markdown()
+                label_out = gr.Label(
+                    num_top_classes=TOP_K, label="Top 3 predicciones"
+                )
+
+            submit.click(
+                fn=classify,
+                inputs=audio_in,
+                outputs=[result_group, error_box, bird_photo, bird_info, label_out],
+            )
+
+        # ----- Tab 2: Las 20 aves -----
+        with gr.Tab("Las 20 aves"):
+            gr.Markdown(
+                "Las 20 especies que el modelo aprendio a reconocer."
+            )
+            # Toda la galeria en UN solo gr.HTML para que el HTML inicial sea
+            # liviano y las fotos se carguen lazy (solo al abrir el tab).
+            gr.HTML(_render_species_gallery_html())
 
 
 if __name__ == "__main__":
-    demo.launch()
+    # allowed_paths habilita que el HTML del header (logo) y las fotos del
+    # tab 2 se sirvan desde app/assets/.
+    demo.launch(allowed_paths=[str(ASSETS_DIR)])

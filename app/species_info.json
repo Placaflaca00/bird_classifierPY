@@ -1,0 +1,165 @@
+{
+  "_comment": "Info por especie para el tab 'Las 20 aves' y el panel de resultado del clasificador. Llenar 'description' con 1-2 lineas de info de la especie. Poner la foto en 'assets/birds/<archivo>.jpg' (el path por defecto sigue el snake_case del nombre cientifico). Si 'description' esta vacio o la foto no existe en disco, el UI usa un placeholder discreto, no rompe.",
+  "species": {
+    "Actitis macularius": {
+      "es": "Playerito manchado",
+      "en": "Spotted Sandpiper",
+      "description": "El playero manchado o andarríos maculado (Actitis macularius) es una especie de ave Charadriiforme de la familia Scolopacidae. Es una pequeña ave limícola, de 18-20 cm de largo. Junto con su especie hermana, el Actitis hypoleucos forman el género Actitis. Ambas especies viven en áreas geográficamente separadas, pero pueden hibridarse.",
+      "photo": "assets/birds/actitis_macularius.jpg",
+      "photo_credit": "(c) Jason Headley, some rights reserved (CC BY-NC), uploaded by Jason Headley",
+      "photo_license": "CC-BY-NC"
+    },
+    "Ara ararauna": {
+      "es": "Guacamayo azul y amarillo",
+      "en": "Blue-and-yellow Macaw",
+      "description": "El guacamayo azulamarillo (Ara ararauna), también conocido como guacamayo azul y amarillo, papagayo amarillo o paraba azul amarillo, es una especie de ave psittaciforme de la familia de los loros endémica de América del Sur. Su área de distribución comprende desde Panamá hasta el norte de Paraguay y Bolivia, pasando por toda la cuenca amazónica. En cautividad se reproducen fácilmente; en libertad viven en grupos de 25-30 ejemplares. Este loro es el representante inconfundible de los...",
+      "photo": "assets/birds/ara_ararauna.jpg",
+      "photo_credit": "(c) KENNEDY BORGES, some rights reserved (CC BY-NC), uploaded by KENNEDY BORGES",
+      "photo_license": "CC-BY-NC"
+    },
+    "Calidris bairdii": {
+      "es": "Playerito de Baird",
+      "en": "Baird's Sandpiper",
+      "description": "El playero de Baird (Calidris bairdii) es una especie de ave charadriforme de la familia Scolopacidae. Es una de las aves playeras más pequeñas. Es un correlimos separado en los Erolia.",
+      "photo": "assets/birds/calidris_bairdii.jpg",
+      "photo_credit": "Jason Crotty - via Wikimedia Commons (CC BY 2.0)",
+      "photo_license": "CC BY 2.0"
+    },
+    "Calidris canutus": {
+      "es": "Playero rojizo",
+      "en": "Red Knot",
+      "description": "El correlimos gordo, playero ártico o playero rojizo (Calidris canutus) es una especie de ave Charadriiforme de la familia Scolopacidae. Es una ave limícola que, en verano, su plumaje es una mezcla de castaño, blanco y negro. En invierno es gris pálido, y se ve en bandadas en las marismas, alimentándose de invertebrados.",
+      "photo": "assets/birds/calidris_canutus.jpg",
+      "photo_credit": "(c) Greg Lasley, some rights reserved (CC BY-NC), uploaded by Greg Lasley",
+      "photo_license": "CC-BY-NC"
+    },
+    "Calidris fuscicollis": {
+      "es": "Playerito de rabadilla blanca",
+      "en": "White-rumped Sandpiper",
+      "description": "El correlimos culiblanco (Calidris fuscicollis), también denominado correlimos lomiblanco, correlimos de Bonaparte, playerito de rabadilla blanca, playero de lomo blanco y chorlito de rabadilla blanca, es una especie de ave caradriforme de la familia Scolopacidae que vive en América. Cría en la tundra de Norteamérica y migra a Sudamérica para pasar el invierno. Es un divagante raro pero regular en Europa y a veces llega incluso hasta Australia.",
+      "photo": "assets/birds/calidris_fuscicollis.jpg",
+      "photo_credit": "(c) Hannah Floyd, some rights reserved (CC BY-NC), uploaded by Hannah Floyd",
+      "photo_license": "CC-BY-NC"
+    },
+    "Calidris melanotos": {
+      "es": "Playerito pectoral",
+      "en": "Pectoral Sandpiper",
+      "description": "El playerito pectoral (Calidris melanotos) es una especie de ave limícola de la familia Scolopacidae. Es de tamaño mediano, más grande que la mayoría de las especies del género. Es claramente visible el contraste en la coloración del pecho, pardo oscuro, con el del resto del vientre, blanco.",
+      "photo": "assets/birds/calidris_melanotos.jpg",
+      "photo_credit": "Andreas Trepte - via Wikimedia Commons (CC BY-SA 2.5)",
+      "photo_license": "CC BY-SA 2.5"
+    },
+    "Calidris minutilla": {
+      "es": "Playerito menudo",
+      "en": "Least Sandpiper",
+      "description": "La menudilla, becacina, patudo, correlimos, menudo o chichicuilote (Calidris minutilla) es una pequeña ave de la familia de los escolopácidos.",
+      "photo": "assets/birds/calidris_minutilla.jpg",
+      "photo_credit": "(c) Greg Lasley, some rights reserved (CC BY-NC), uploaded by Greg Lasley",
+      "photo_license": "CC-BY-NC"
+    },
+    "Calidris pusilla": {
+      "es": "Playerito semipalmado",
+      "en": "Semipalmated Sandpiper",
+      "description": "El correlimos semipalmeado, Calidris pusilla, un ave limícola muy pequeña de la familia Scolopacidae. A veces es separada junto con otros correlimos pequeños en Erolia, pero aunque este grupo parece ser monofilético, el nombre genérico más antiguo de esta especie Ereunetes fue propuesto antes que Erolia.",
+      "photo": "assets/birds/calidris_pusilla.jpg",
+      "photo_credit": "(c) brian stahls, some rights reserved (CC BY-NC), uploaded by brian stahls",
+      "photo_license": "CC-BY-NC"
+    },
+    "Chauna torquata": {
+      "es": "Chaja",
+      "en": "Southern Screamer",
+      "description": "El chajá (Chauna torquata) es una especie de ave del orden anseriforme de la familia Anhimidae que habita en buena parte del sur y centro de Sudamérica. Tiene gran tamaño, unos 75 cm de pico a cola, y se considera un símbolo de las pampas. Es miembro de una familia de aves exclusiva de América del Sur y está emparentado con los cisnes y los gansos, aunque a primera vista no se parece a ninguno de...",
+      "photo": "assets/birds/chauna_torquata.jpg",
+      "photo_credit": "(c) Antonino Gonçalves Medina, some rights reserved (CC BY-NC), uploaded by Antonino Gonçalves Medina",
+      "photo_license": "CC-BY-NC"
+    },
+    "Columba livia": {
+      "es": "Paloma domestica",
+      "en": "Rock Pigeon",
+      "description": "La paloma bravía (Columba livia) es una especie de ave columbiforme de la familia Columbidae. Es el ancestro de las palomas domésticas, con las que se entrecruza, lo que demuestra lo estrecho de su parentesco. Anida en las paredes rocosas, por lo que se la llama también comúnmente \"paloma de las rocas\". Se parece mucho a la paloma doméstica típica, pero ésta última posee un genoma muy diverso y en consecuencia, algunas presentan formas y colores...",
+      "photo": "assets/birds/columba_livia.jpg",
+      "photo_credit": "(c) Birds of Gilgit-Baltistan, some rights reserved (CC BY-SA)",
+      "photo_license": "CC-BY-SA"
+    },
+    "Heliornis fulica": {
+      "es": "Ipequi",
+      "en": "Sungrebe",
+      "description": "El punpún o pájaro cantil (Heliornis fulica) es una especie de ave gruiforme de la familia Heliornithidae. Habita desde México hasta Uruguay. Es el único miembro del género Heliornis y una de las tres especies de la familia Heliornithidae; las otras dos viven en puntos muy alejados; una en África (Podica senegalensis) y la otra en el sudeste asiático (Heliopais personata). Su población ha sido reducida por cacería y comercio ilegal como ave de jaula para...",
+      "photo": "assets/birds/heliornis_fulica.jpg",
+      "photo_credit": "(c) Antonio Amaral, some rights reserved (CC BY-NC), uploaded by Antonio Amaral",
+      "photo_license": "CC-BY-NC"
+    },
+    "Jabiru mycteria": {
+      "es": "Jabiru",
+      "en": "Jabiru",
+      "description": "El jabirú o tuyuyu (Jabiru mycteria) es una especie de ave ciconiforme de la familia Ciconiidae; es la mayor cigüeña del Nuevo Mundo. Con una altura de 120-140 cm y una envergadura (alas desplegadas) de 3 metros, es una ave inconfundible de los humedales americanos desde Yucatán hasta la pampa argentina, siendo abundante en zonas como los llanos venezolanos o el pantanal. Se parece bastante a su pariente africano, el marabú, pero a diferencia de éste...",
+      "photo": "assets/birds/jabiru_mycteria.jpg",
+      "photo_credit": "(c) David Schenfeld (busy), some rights reserved (CC BY-NC-ND)",
+      "photo_license": "CC-BY-NC-ND"
+    },
+    "Ortalis canicollis": {
+      "es": "Charata",
+      "en": "Chaco Chachalaca",
+      "description": "La charata (Ortalis canicollis) es una especie de ave galliforme de la familia Cracidae que habita en el Chaco de Bolivia, Brasil, Paraguay, Uruguay, Argentina, en bosques y sabanas de tipo chaqueño.",
+      "photo": "assets/birds/ortalis_canicollis.jpg",
+      "photo_credit": "(c) Pablo Demaio, some rights reserved (CC BY-NC), uploaded by Pablo Demaio",
+      "photo_license": "CC-BY-NC"
+    },
+    "Pipile jacutinga": {
+      "es": "Yacutinga",
+      "en": "Black-fronted Piping-guan",
+      "description": "El yacutinga (Pipile jacutinga) es una especie de ave galliforme de la familia de las Cracidae endémica del sur de Brasil y regiones adyacentes de Argentina y Paraguay. Está en peligro de extinción, por su caza y destrucción de hábitat.",
+      "photo": "assets/birds/pipile_jacutinga.jpg",
+      "photo_credit": "no rights reserved, uploaded by Hugo Hulsberg",
+      "photo_license": "CC0"
+    },
+    "Pluvialis dominica": {
+      "es": "Chorlo dorado",
+      "en": "American Golden-Plover",
+      "description": "El chorlito dorado chico o chorlo pampa (Pluvialis dominica) es una especie de ave Charadriiforme de la familia Charadriidae",
+      "photo": "assets/birds/pluvialis_dominica.jpg",
+      "photo_credit": "O. W. Johnson - via Wikimedia Commons (Public domain)",
+      "photo_license": "Public domain"
+    },
+    "Pluvialis squatarola": {
+      "es": "Chorlo gris",
+      "en": "Black-bellied Plover",
+      "description": "El chorlito gris o chorlo ártico (Pluvialis squatarola) es una especie de ave Charadriiforme de la familia Charadriidae propio de la tundra",
+      "photo": "assets/birds/pluvialis_squatarola.jpg",
+      "photo_credit": "Hans Hillewaert - via Wikimedia Commons (CC BY-SA 3.0)",
+      "photo_license": "CC BY-SA 3.0"
+    },
+    "Ramphastos toco": {
+      "es": "Tucan toco",
+      "en": "Toco Toucan",
+      "description": "El tucán toco o tucán grande (Ramphastos toco) es el miembro más grande y conocido de la familia de los tucanes, su hábitat natural es América del Sur y es una especie que se encuentra habitualmente en los zoológicos de todo el mundo.",
+      "photo": "assets/birds/ramphastos_toco.jpg",
+      "photo_credit": "(c) Paul Steeves, some rights reserved (CC BY-NC), uploaded by Paul Steeves",
+      "photo_license": "CC-BY-NC"
+    },
+    "Rhea americana": {
+      "es": "Nandu",
+      "en": "Greater Rhea",
+      "description": "El ñandú común (Rhea americana), también llamado avestruz americano, es una especie de ave estrutioniforme de la familia Rheidae. Se encuentra exclusivamente en Sudamérica.",
+      "photo": "assets/birds/rhea_americana.jpg",
+      "photo_credit": "(c) Martin Arregui, some rights reserved (CC BY-NC), uploaded by Martin Arregui",
+      "photo_license": "CC-BY-NC"
+    },
+    "Tringa flavipes": {
+      "es": "Pitotoy chico",
+      "en": "Lesser Yellowlegs",
+      "description": "Tringa flavipes, conocido en América del Sur como pitotoy chico es un ave limícola de talla mediana, similar en apariencia a Tringa melanoleuca o pitotoy grande. Sin embargo, no está relacionado cercanamente a éste, sino a Tringa semipalmata o playero aliblanco, de apariencia menos similar, excepto por el plumaje del cuello, con un patrón fino y denso característico en su temporada reproductiva.",
+      "photo": "assets/birds/tringa_flavipes.jpg",
+      "photo_credit": "(c) Jonathan Irons, some rights reserved (CC BY-NC), uploaded by Jonathan Irons",
+      "photo_license": "CC-BY-NC"
+    },
+    "Tringa melanoleuca": {
+      "es": "Pitotoy grande",
+      "en": "Greater Yellowlegs",
+      "description": "El chorlo mayor de patas amarillas, archibebe patigualdo grande o pitotoy grande (Tringa melanoleuca) es una especie de ave Charadriiforme de la familia Scolopacidae propia de Norteamérica, de apariencia similar a Tringa flavipes.",
+      "photo": "assets/birds/tringa_melanoleuca.jpg",
+      "photo_credit": "(c) Pablo Balduvino, some rights reserved (CC BY-NC), uploaded by Pablo Balduvino",
+      "photo_license": "CC-BY-NC"
+    }
+  }
+}

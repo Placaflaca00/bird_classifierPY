@@ -28,6 +28,35 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+# ---------------------------------------------------------------------------
+# Carga de .env (sin dependencia python-dotenv)
+# ---------------------------------------------------------------------------
+# En HF Spaces no existe .env (las env vars vienen del Settings del Space),
+# asi que el bloque es no-op alla. Localmente, evita que el usuario tenga que
+# exportar la URL en cada sesion PowerShell.
+def _load_dotenv() -> None:
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            # setdefault: una env var ya exportada en la shell gana sobre .env.
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except OSError:
+        pass  # silencioso: el caller maneja "config" si falla la URL.
+
+
+_load_dotenv()
+
+
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
