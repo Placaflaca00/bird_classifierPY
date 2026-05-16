@@ -74,6 +74,24 @@ _ERROR_MESSAGES = {
     ),
 }
 
+# Fase 2 - Nivel 2 — mensajes user-facing cuando el backend rechaza el audio
+# por gating (no por error tecnico). reject_reason -> texto al usuario.
+# Estilo sin acentos para matchear el resto del codebase (cf. _ERROR_MESSAGES).
+_REJECT_MESSAGES = {
+    "not_a_bird": (
+        "No detecte un ave en el audio. Proba con una grabacion donde el "
+        "canto del ave sea claro."
+    ),
+    "white_noise": (
+        "El audio parece ruido sintetico. Proba con una grabacion de campo "
+        "de un pajaro."
+    ),
+    "pure_tone": (
+        "El audio es un tono puro (sin armonicos de canto). Proba con una "
+        "grabacion de un pajaro real."
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Carga module-level de species_info
@@ -266,6 +284,19 @@ def classify(audio_path: str | None):
             msg = _ERROR_MESSAGES.get(
                 result.error_kind, "Ocurrio un error inesperado."
             )
+        hidden = _hidden_result()
+        return (
+            hidden[0],
+            gr.update(visible=True, value=msg),
+            hidden[1], hidden[2], hidden[3],
+        )
+
+    # Fase 2 - Nivel 2: backend rechazo el audio por gating. Mensaje
+    # especifico por reason. Panel de resultado oculto (sin foto/ficha
+    # colgando del estado anterior) y error_box con texto user-friendly.
+    if not result.detected:
+        reason = result.reject_reason or "not_a_bird"
+        msg = _REJECT_MESSAGES.get(reason, _REJECT_MESSAGES["not_a_bird"])
         hidden = _hidden_result()
         return (
             hidden[0],
