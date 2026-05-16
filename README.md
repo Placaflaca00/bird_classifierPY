@@ -4,9 +4,25 @@
 ![python](https://img.shields.io/badge/python-3.11-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Clasificador de aves de Paraguay por audio.
-Pipeline: BirdNET (TFLite) extrae embeddings de 320 dimensiones → cabezal MLP propio entrenado con PyTorch Lightning.
+Clasificador de aves de Paraguay por audio (20 especies).
+Pipeline: BirdNET V2.4 (TFLite) extrae embeddings de 1024 dimensiones → cabezal MLP propio entrenado con PyTorch Lightning → ONNX para producción.
 Deploy en AWS Lambda (Docker + ECR + API Gateway) con frontend Gradio en HuggingFace Spaces.
+
+## Results
+
+Benchmark `wa-drop3-v1` (modelo en producción) vs BirdNET V2.4 nativo sobre el mismo audio, mapeando el top-1 nativo a las 20 especies del scope:
+
+| Test set | n | Baseline (BirdNET nativo) | Pipeline (mio) | Delta |
+|---|--:|--:|--:|--:|
+| **clean** | 351 | 70.4% top-1 / **63.6% macro** | **94.6% / 93.1% macro** | **+24.2pp / +29.6pp macro** |
+| **hard (OOD)** | 208 | 38.9% top-1 / **34.5% macro** | **81.2% / 87.7% macro** | **+42.3pp / +53.2pp macro** |
+
+- **Macro accuracy** (promedio per-especie sin pesos) es la métrica primaria — pondera todas las clases por igual y no se infla con las clases que tienen muchos audios.
+- **Pipeline gana o empata en las 20 especies, en ambos folds.** Sin regresiones.
+- **Pipile jacutinga** (especie paraguaya no presente en BirdNET V2.4 ni como sinónimo `Aburria`/`Penelope`): baseline 0% garantizado, pipeline 10/10 correct. Ilustra por qué el fine-tuning aporta valor sobre un modelo pretrained de cobertura global.
+- Robustez OOD: gap clean→hard del pipeline -13pp, del baseline -31pp. El fine-tuning también comprime la varianza easy/hard.
+
+Tabla completa con per-species + decisiones metodológicas: [`benchmarks/baseline_vs_finetuned_2026-05-16.md`](benchmarks/baseline_vs_finetuned_2026-05-16.md).
 
 ## Stack
 
