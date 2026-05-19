@@ -1,14 +1,26 @@
-"""Cliente HTTP del endpoint /predict (API Gateway de Fase 1).
+"""Cliente HTTP del flow de prediccion (Fase 3 — S3 presigned URLs).
 
-Envuelve el POST a ``${API_GATEWAY_URL}`` con:
-    - reintentos automáticos en 429/503 y errores de conexión (urllib3 Retry),
-    - manejo de errores mapeado a un único ``PredictResult`` (la UI no atrapa
-      excepciones: chequea ``result.ok`` y, si es False, ``error_kind``).
+Flujo de ``predict(audio)`` por llamada (3 requests):
+    1. POST ``/upload-url`` -> presigned PUT URL + s3_key
+    2. PUT audio directo a S3 (no pasa por API GW)
+    3. POST ``/predict`` con ``{s3_key, top_k}`` -> PredictResult
 
-No depende de ``src/`` — el Space de HuggingFace no debe importar el paquete
-pesado. La URL se lee de la variable de entorno ``API_GATEWAY_URL``.
+El backend Lambda mantiene retrocompat con ``audio_b64`` (clientes externos /
+mobile native podrian usarla), pero este cliente solo usa el flow S3. Razon:
+simpler is better, un solo data path mejor para mantener y debuggear.
 
-Test local (exportar la URL primero):
+URLs:
+- ``/predict``: viene de env ``API_GATEWAY_URL`` (full URL terminando en /predict).
+- ``/upload-url``: se DERIVA reemplazando ``/predict`` -> ``/upload-url`` (no
+  necesita env var nueva). Asume convencion: ambos endpoints viven en el mismo
+  stage del mismo API.
+
+Errores: mapeados a un unico ``PredictResult.error_kind`` para que la UI tenga
+un solo code path. ``predict()`` nunca lanza por errores de red/HTTP.
+
+No depende de ``src/`` — el Space HuggingFace no debe importar el paquete pesado.
+
+Test local (exportar URL primero):
     $env:API_GATEWAY_URL = "https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/predict"
     python app/client.py data/test_sets/xc_hard/ortalis_canicollis/XC343334.mp3
     python app/client.py <audio.mp3> --top-k 5
@@ -17,7 +29,6 @@ Test local (exportar la URL primero):
 from __future__ import annotations
 
 import argparse
-import base64
 import os
 import sys
 from dataclasses import dataclass, field
@@ -67,6 +78,15 @@ DEFAULT_TOP_K = 3
 # medido en Fase 1 fue ~26.8 s y el cap de integración del HTTP API es 30 s.
 REQUEST_TIMEOUT: tuple[float, float] = (5.0, 35.0)
 
+# Fase 3: timeouts separados.
+# - /upload-url: sin BirdNET, super rapido (solo genera URL). Cap chico.
+# - PUT a S3: no pasa por API GW, sin cap de integration. Read mas largo
+#   para audios grandes (15 MB en ~5 s con buena conexion). NO usa retries
+#   del Session: presigned tiene TTL 10min, reintentar es seguro pero si
+#   falla mejor pedir URL nueva.
+UPLOAD_URL_TIMEOUT: tuple[float, float] = (5.0, 15.0)
+S3_PUT_TIMEOUT: tuple[float, float] = (5.0, 30.0)
+
 # Reintentos: backoff 1.5s / 3s / 6s. status_forcelist incluye 429 y 503 porque
 # Fase 1 verificó que el throttling del HTTP API devuelve 503 (no el 429 que
 # documenta AWS).
@@ -78,6 +98,23 @@ RETRY_STATUS = (429, 503)
 # ---------------------------------------------------------------------------
 # Resultado
 # ---------------------------------------------------------------------------
+@dataclass
+class UploadUrlResult:
+    """Resultado de POST /upload-url. Mismo patron que PredictResult.
+
+    Si ``ok=True``: ``upload_url`` + ``s3_key`` + ``content_type`` listos
+    para usar (PUT a S3 + post-predict con s3_key).
+    Si ``ok=False``: ``error_kind`` + ``error_message`` explican que paso.
+    """
+
+    ok: bool
+    upload_url: str | None = None
+    s3_key: str | None = None
+    content_type: str | None = None
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
 @dataclass
 class PredictResult:
     """Resultado de una llamada a /predict.
@@ -105,7 +142,7 @@ class PredictResult:
     reject_reason: str | None = None
     max_birdnet_confidence: float | None = None
     # "throttled" | "timeout" | "server" | "bad_request"
-    #   | "network" | "bad_response" | "config"
+    #   | "network" | "bad_response" | "config" | "upload_failed"
     error_kind: str | None = None
     error_message: str | None = None
 
@@ -164,12 +201,139 @@ def _resolve_api_url(api_url: str | None) -> str:
     return (api_url or os.environ.get(API_URL_ENV, "")).strip()
 
 
-def _encode_audio(audio: str | Path | bytes) -> str:
-    """Path o bytes de audio -> base64 ascii."""
-    raw = audio if isinstance(audio, bytes) else Path(audio).read_bytes()
-    if not raw:
-        raise ValueError("el audio está vacío")
-    return base64.b64encode(raw).decode("ascii")
+def _derive_upload_url_url(predict_url: str) -> str:
+    """Deriva la URL de /upload-url a partir de la de /predict.
+
+    Asume convencion: ambos endpoints viven en el mismo stage del mismo API.
+    Si predict_url termina en '/predict', reemplaza ese segmento.
+    Fallback: si no termina en '/predict' (config rara), append '/upload-url'
+    al base — defensa pasiva, no crashea pero el caller probablemente vea
+    un 404 despues si la convencion no se cumple.
+    """
+    if predict_url.endswith("/predict"):
+        return predict_url[: -len("/predict")] + "/upload-url"
+    return predict_url.rstrip("/") + "/upload-url"
+
+
+def _get_upload_url(ext: str, api_url: str | None = None) -> UploadUrlResult:
+    """POST /upload-url con {'ext': ext}. Devuelve presigned + key + MIME.
+
+    Usa la session global (reusa pool de conexiones + retries 429/503).
+    Errores mapeados al mismo set de error_kind del predict().
+    Nunca lanza — el caller chequea UploadUrlResult.ok.
+    """
+    base = _resolve_api_url(api_url)
+    if not base:
+        return UploadUrlResult(
+            ok=False, error_kind="config",
+            error_message=f"falta la variable de entorno {API_URL_ENV}",
+        )
+    url = _derive_upload_url_url(base)
+
+    try:
+        resp = _get_session().post(
+            url, json={"ext": ext}, timeout=UPLOAD_URL_TIMEOUT,
+        )
+    except requests.exceptions.RetryError:
+        return UploadUrlResult(
+            ok=False, error_kind="throttled",
+            error_message="el servicio está saturado, probá de nuevo en unos segundos",
+        )
+    except requests.exceptions.ConnectionError:
+        return UploadUrlResult(
+            ok=False, error_kind="network",
+            error_message="no se pudo conectar con el servidor",
+        )
+    except requests.exceptions.Timeout:
+        return UploadUrlResult(
+            ok=False, error_kind="timeout",
+            error_message="el servidor tardó demasiado en responder",
+        )
+    except requests.exceptions.RequestException as e:
+        return UploadUrlResult(
+            ok=False, error_kind="network",
+            error_message=f"error de red: {e}",
+        )
+
+    status = resp.status_code
+    if status == 200:
+        try:
+            data = resp.json()
+        except ValueError:
+            return UploadUrlResult(
+                ok=False, error_kind="bad_response",
+                error_message="respuesta de /upload-url no es JSON válido",
+            )
+        if not isinstance(data, dict) or not data.get("upload_url") or not data.get("s3_key"):
+            return UploadUrlResult(
+                ok=False, error_kind="bad_response",
+                error_message="respuesta de /upload-url incompleta",
+            )
+        return UploadUrlResult(
+            ok=True,
+            upload_url=data["upload_url"],
+            s3_key=data["s3_key"],
+            content_type=data.get("content_type"),
+        )
+
+    detail = _extract_error_detail(resp)
+    if status == 400:
+        return UploadUrlResult(
+            ok=False, error_kind="bad_request",
+            error_message=detail or "el servidor rechazó el pedido de subida",
+        )
+    if status == 404:
+        return UploadUrlResult(
+            ok=False, error_kind="config",
+            error_message="el endpoint /upload-url no existe (config wrong)",
+        )
+    if status in RETRY_STATUS:
+        return UploadUrlResult(
+            ok=False, error_kind="throttled",
+            error_message="el servicio está saturado, probá de nuevo en unos segundos",
+        )
+    if 500 <= status < 600:
+        return UploadUrlResult(
+            ok=False, error_kind="server",
+            error_message=detail or f"error interno del servidor (HTTP {status})",
+        )
+    return UploadUrlResult(
+        ok=False, error_kind="bad_request",
+        error_message=detail or f"respuesta inesperada del servidor (HTTP {status})",
+    )
+
+
+def _upload_to_s3(
+    presigned_url: str, audio_bytes: bytes, content_type: str,
+) -> tuple[bool, str | None]:
+    """PUT bytes a S3 con presigned URL. Header Content-Type EXPLICITO.
+
+    S3 valida que el Content-Type del PUT matchee el ContentType firmado en
+    el presigned. Si difiere -> 403 SignatureDoesNotMatch.
+
+    NO usa la session con retries: presigned tiene TTL 10min, si falla mejor
+    pedir URL nueva que reintentar la misma.
+
+    Returns (ok, error_message). El error_message es para logging del caller,
+    no se muestra directo al usuario (el caller mapea a 'upload_failed').
+    """
+    try:
+        resp = requests.put(
+            presigned_url,
+            data=audio_bytes,
+            headers={"Content-Type": content_type},
+            timeout=S3_PUT_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        return False, "timeout al subir a S3"
+    except requests.exceptions.ConnectionError:
+        return False, "no se pudo conectar con S3"
+    except requests.exceptions.RequestException as e:
+        return False, f"error de red al subir a S3: {e}"
+
+    if resp.status_code in (200, 204):
+        return True, None
+    return False, f"S3 rechazó el upload (HTTP {resp.status_code})"
 
 
 def _extract_error_detail(resp: requests.Response) -> str | None:
@@ -283,10 +447,20 @@ def predict(
     top_k: int = DEFAULT_TOP_K,
     api_url: str | None = None,
 ) -> PredictResult:
-    """Envía ``audio`` a /predict y devuelve un PredictResult.
+    """Sube ``audio`` a S3 y dispara la prediccion. Devuelve PredictResult.
+
+    Flow (3 requests):
+        1. POST /upload-url -> presigned URL + s3_key
+        2. PUT audio a S3 (directo, no por API GW)
+        3. POST /predict {s3_key, top_k}
 
     Nunca lanza por errores de red/HTTP: todo se mapea a ``error_kind``.
-    ``audio`` puede ser un path (str/Path) o los bytes crudos del archivo.
+    ``audio`` puede ser path (str/Path) o bytes crudos del archivo.
+
+    ``ext`` para el presigned se infiere del path. Si ``audio`` es bytes
+    (no hay path), asume ``mp3`` (formato mas comun). La validation del
+    frontend (``app/validation.py``) ya rechazo formatos no soportados
+    antes de llegar aca, asi que en practica el ext es valido.
     """
     url = _resolve_api_url(api_url)
     if not url:
@@ -295,32 +469,61 @@ def predict(
             error_message=f"falta la variable de entorno {API_URL_ENV}",
         )
 
+    # --- Step 1: leer bytes + inferir extension del path ----------------
     try:
-        audio_b64 = _encode_audio(audio)
+        if isinstance(audio, bytes):
+            audio_bytes = audio
+            ext = "mp3"  # fallback razonable; validation ya filtro arriba
+        else:
+            audio_path = Path(audio)
+            audio_bytes = audio_path.read_bytes()
+            ext = audio_path.suffix.lstrip(".").lower() or "mp3"
+        if not audio_bytes:
+            return PredictResult(
+                ok=False, error_kind="bad_request",
+                error_message="el audio está vacío",
+            )
     except (OSError, ValueError) as e:
         return PredictResult(
             ok=False, error_kind="bad_request",
             error_message=f"no se pudo leer el audio: {e}",
         )
 
-    body = {"audio_b64": audio_b64, "top_k": int(top_k)}
+    # --- Step 2: pedir presigned URL ------------------------------------
+    upload = _get_upload_url(ext, api_url=url)
+    if not upload.ok:
+        # Propaga error_kind del upload (config/network/throttled/server/bad_request).
+        return PredictResult(
+            ok=False, error_kind=upload.error_kind,
+            error_message=upload.error_message,
+        )
+
+    # --- Step 3: PUT a S3 ----------------------------------------------
+    s3_ok, s3_err = _upload_to_s3(
+        upload.upload_url, audio_bytes, upload.content_type or "application/octet-stream",
+    )
+    if not s3_ok:
+        return PredictResult(
+            ok=False, error_kind="upload_failed",
+            error_message=f"no se pudo subir el audio: {s3_err}",
+        )
+
+    # --- Step 4: POST /predict con s3_key ------------------------------
+    body = {"s3_key": upload.s3_key, "top_k": int(top_k)}
 
     try:
         resp = _get_session().post(url, json=body, timeout=REQUEST_TIMEOUT)
     except requests.exceptions.RetryError:
-        # 429/503 reintentados y agotados.
         return PredictResult(
             ok=False, error_kind="throttled",
             error_message="el servicio está saturado, probá de nuevo en unos segundos",
         )
     except requests.exceptions.ConnectionError:
-        # Incluye ConnectTimeout. Errores de conexión ya reintentados y agotados.
         return PredictResult(
             ok=False, error_kind="network",
             error_message="no se pudo conectar con el servidor",
         )
     except requests.exceptions.Timeout:
-        # ReadTimeout (no reintentado, read=False) o timeout genérico.
         return PredictResult(
             ok=False, error_kind="timeout",
             error_message="el servidor tardó demasiado en responder",

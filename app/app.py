@@ -72,6 +72,12 @@ _ERROR_MESSAGES = {
         "El servicio esta mal configurado (es un problema nuestro, no de tu "
         "audio). Avisa al administrador."
     ),
+    # Fase 3: error en el PUT directo a S3 (presigned URL). Normalmente es
+    # conexion inestable; el usuario reintenta y suele resolverse.
+    "upload_failed": (
+        "No se pudo subir el audio al servidor. Revisa tu conexion y proba "
+        "de nuevo (puede ser un audio muy grande, o conexion inestable)."
+    ),
 }
 
 # Fase 2 - Nivel 2 — mensajes user-facing cuando el backend rechaza el audio

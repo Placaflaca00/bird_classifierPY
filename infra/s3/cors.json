@@ -1,0 +1,15 @@
+{
+  "CORSRules": [
+    {
+      "AllowedHeaders": ["Content-Type", "x-amz-*"],
+      "AllowedMethods": ["PUT"],
+      "AllowedOrigins": [
+        "https://placaflaca-bird-classifier-py.hf.space",
+        "http://localhost:7860",
+        "http://127.0.0.1:7860"
+      ],
+      "ExposeHeaders": [],
+      "MaxAgeSeconds": 3000
+    }
+  ]
+}

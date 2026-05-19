@@ -21,11 +21,15 @@ import base64
 import io
 import json
 import os
+import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
+import boto3
 import numpy as np
+from botocore.client import Config
 
 # ---------------------------------------------------------------------------
 # Constantes y rutas
@@ -49,6 +53,31 @@ EMBEDDING_DIM = 1024
 MODEL_VERSION = "classifier_v1"  # bump en cada retrain; documentar en ADR
 
 DEFAULT_TOP_K = 3
+
+# Fase 3: S3 presigned URLs para audios largos (cap 30s del API GW desaparece
+# cuando el browser sube directo a S3 y manda solo el s3_key al /predict).
+S3_UPLOADS_BUCKET = "conocetuave-py-uploads"
+S3_UPLOADS_PREFIX = "uploads/"
+PRESIGNED_URL_EXPIRES_S = 600  # 10 min — alcanza para subir, no tanto para abusar
+
+# MIME types soportados. Whitelist contra inputs malformados ("exe", "../").
+# Subset estricto de validation.py:ALLOWED_FORMATS — m4a NO esta porque el
+# frontend Gradio convierte a wav del lado servidor antes de mandar (Safari
+# iOS verificado 2026-05-17, no necesitamos soportar m4a aca).
+_CONTENT_TYPE_BY_EXT = {
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "flac": "audio/flac",
+}
+
+# Patron estricto para s3_key. Solo aceptamos keys que MATCHEEN lo que
+# nosotros generamos (UUID4 + extension whitelisted). Defense in depth:
+# rechaza path traversal, prefix wrong, formatos no soportados ANTES de
+# tocar S3. UUID4 con hex lowercase (uuid.uuid4() siempre lo es).
+_S3_KEY_PATTERN = re.compile(
+    r"^uploads/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(mp3|wav|ogg|flac)$"
+)
 
 # Fase 2 - Nivel 2: gating OOD via clasificador nativo de BirdNET.
 # Sigmoid puro (no flat_sigmoid con sensitivity). Para gating binario
@@ -190,6 +219,16 @@ _BIRDNET = _load_birdnet()
 _CLASSIFIER_SESS, _IDX_TO_SPECIES, _CLASSIFIER_META = _load_classifier()
 _SPECIES_META = _load_species_metadata()
 _NUM_CLASSES = len(_IDX_TO_SPECIES)
+
+# boto3 S3 client module-level: reuse entre invocations (cold start cost
+# solo la primera). Sigv4 + region explicita: sin esto, S3 puede devolver
+# 307 Temporary Redirect que el browser no sigue en PUTs presigned
+# (caso conocido AWS re:Post).
+_S3_CLIENT = boto3.client(
+    "s3",
+    region_name="us-east-1",
+    config=Config(signature_version="s3v4"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +386,79 @@ def _classify_synthetic(y: np.ndarray) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Fase 3: presigned uploads + S3 download
+# ---------------------------------------------------------------------------
+def _generate_upload_url(ext: str) -> dict:
+    """Devuelve presigned PUT URL + metadata para upload directo a S3.
+
+    Args:
+        ext: extension del archivo (sin punto). Whitelist estricta:
+             mp3, wav, ogg, flac. Normalizamos a lowercase + strip antes
+             de validar (rechaza "WAV", " mp3 ", "MP3").
+
+    Returns:
+        {"upload_url": str, "s3_key": str, "expires_in": int, "content_type": str}
+
+    Raises:
+        ValueError: ext no soportada.
+
+    ContentType se pasa EXPLICITO en Params. S3 rechaza el PUT si el browser
+    manda un MIME distinto al firmado — defense in depth contra uploads
+    no-deseados (AWS docs recomienda esto explicitamente).
+    """
+    ext = ext.lower().strip()
+    if ext not in _CONTENT_TYPE_BY_EXT:
+        raise ValueError(
+            f"extension no soportada: {ext!r}. "
+            f"Permitidas: {sorted(_CONTENT_TYPE_BY_EXT)}"
+        )
+    content_type = _CONTENT_TYPE_BY_EXT[ext]
+    s3_key = f"{S3_UPLOADS_PREFIX}{uuid.uuid4()}.{ext}"
+
+    upload_url = _S3_CLIENT.generate_presigned_url(
+        ClientMethod="put_object",
+        Params={
+            "Bucket": S3_UPLOADS_BUCKET,
+            "Key": s3_key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=PRESIGNED_URL_EXPIRES_S,
+        HttpMethod="PUT",
+    )
+
+    return {
+        "upload_url": upload_url,
+        "s3_key": s3_key,
+        "expires_in": PRESIGNED_URL_EXPIRES_S,
+        "content_type": content_type,
+    }
+
+
+def _read_audio_from_s3(s3_key: str) -> bytes:
+    """Lee bytes de un object S3. Valida formato del key ANTES de tocar S3.
+
+    Rechaza:
+        - path traversal: "../etc/passwd", "/absolute/path", etc.
+        - prefix wrong: "other/file.mp3", "models/x.bin"
+        - formato wrong: "uploads/random_name.mp3" (no es UUID4)
+
+    Defense in depth: solo deserializamos keys que MATCHEEN lo que el propio
+    Lambda generó (regex en _S3_KEY_PATTERN). Si alguien intenta leer un
+    object que por casualidad existe pero no fue generado por nosotros, se
+    rechaza antes del S3 call (ahorra request + cierra ataque de
+    enumeration).
+
+    Raises:
+        ValueError: s3_key no matchea el patron esperado.
+        _S3_CLIENT.exceptions.NoSuchKey: object no existe en S3 (expirado o nunca subido).
+    """
+    if not _S3_KEY_PATTERN.match(s3_key):
+        raise ValueError("s3_key inválido: formato no reconocido")
+    obj = _S3_CLIENT.get_object(Bucket=S3_UPLOADS_BUCKET, Key=s3_key)
+    return obj["Body"].read()
+
+
+# ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
 def _parse_body(event: dict) -> dict:
@@ -372,13 +484,59 @@ def _response(status: int, payload: dict) -> dict:
 
 
 def handler(event: dict, context: Any = None) -> dict:
-    """AWS Lambda entry point.
+    """AWS Lambda entry point — routea por path.
 
-    Body schema v1 (testing + primer deploy):
+    Rutas (API Gateway HTTP API v2 envia `rawPath`):
+        POST /upload-url   -> presigned PUT URL para subir audio a S3
+        POST /predict      -> clasifica audio (default si rawPath ausente, para
+                              preservar compat con tests directos sin event API GW)
+
+    El refactor a routing (Fase 3) en vez de un solo handler mantiene la
+    misma Lambda function ARN — API Gateway routea 2 paths al mismo Lambda
+    y nosotros despachamos internamente. Mas barato que 2 Lambdas separadas
+    (sin cold start duplicado).
+    """
+    raw_path = event.get("rawPath") or event.get("path") or ""
+    if raw_path.endswith("/upload-url"):
+        return _handle_upload_url(event)
+    return _handle_predict(event)
+
+
+def _handle_upload_url(event: dict) -> dict:
+    """POST /upload-url -> genera presigned PUT URL para S3.
+
+    Body schema: {"ext": "mp3"}  (mp3 | wav | ogg | flac)
+    Response 200: {"upload_url", "s3_key", "expires_in", "content_type"}
+    Response 400: ext faltante, no string, o no whitelisted.
+    Response 500: generate_presigned_url fallo (IAM, network, etc).
+    """
+    try:
+        body = _parse_body(event)
+    except ValueError as e:
+        return _response(400, {"error": str(e)})
+
+    ext = body.get("ext")
+    if not isinstance(ext, str) or not ext.strip():
+        return _response(400, {"error": "body debe tener 'ext' (string: mp3/wav/ogg/flac)"})
+
+    try:
+        result = _generate_upload_url(ext)
+    except ValueError as e:
+        return _response(400, {"error": str(e)})
+    except Exception as e:  # noqa: BLE001 — boto3 puede lanzar varias clases
+        return _response(500, {"error": f"presigned URL falló: {type(e).__name__}: {e}"})
+
+    return _response(200, result)
+
+
+def _handle_predict(event: dict) -> dict:
+    """POST /predict -> clasifica audio.
+
+    Body schema v1 (audio chico, base64 inline):
         {"audio_b64": "<base64>", "top_k": 3}
 
-    Body schema v2 (cuando los audios pasen 4-5 MB) — bifurcación lista, no implementada:
-        {"s3_key": "uploads/abc.mp3", "top_k": 3}
+    Body schema v2 (Fase 3 — audios largos via S3):
+        {"s3_key": "uploads/<uuid4>.<ext>", "top_k": 3}
 
     Top-k clip a [1, num_classes]. Default 3.
     """
@@ -393,18 +551,24 @@ def handler(event: dict, context: Any = None) -> dict:
     except (TypeError, ValueError):
         return _response(400, {"error": f"top_k inválido: {top_k_raw!r}"})
 
-    # Bifurcación audio_b64 / s3_key
+    # Bifurcación audio_b64 / s3_key. Retrocompat: audio_b64 sigue funcionando
+    # para clientes que no quieran el round-trip extra de presigned URL.
     if "audio_b64" in body:
         try:
             audio_bytes = base64.b64decode(body["audio_b64"], validate=True)
         except (ValueError, base64.binascii.Error) as e:
             return _response(400, {"error": f"audio_b64 inválido: {e}"})
     elif "s3_key" in body:
-        # v2: presigned S3 download. Cuando se implemente: boto3 + IAM s3:GetObject
-        # sobre el bucket S3_FEEDBACK_BUCKET / S3_UPLOADS_BUCKET (a definir).
-        return _response(501, {
-            "error": "s3_key path no implementado todavía. Usá audio_b64 en v1.",
-        })
+        try:
+            audio_bytes = _read_audio_from_s3(body["s3_key"])
+        except ValueError as e:
+            # Key invalido (path traversal, prefix wrong, formato wrong) —
+            # NO tocamos S3, defense in depth.
+            return _response(400, {"error": str(e)})
+        except _S3_CLIENT.exceptions.NoSuchKey:
+            return _response(404, {"error": "s3_key no existe o expiró"})
+        except Exception as e:  # noqa: BLE001
+            return _response(500, {"error": f"S3 read falló: {type(e).__name__}: {e}"})
     else:
         return _response(400, {"error": "body debe tener 'audio_b64' o 's3_key'"})
 

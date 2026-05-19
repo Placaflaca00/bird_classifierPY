@@ -28,14 +28,22 @@ import mutagen
 # ---------------------------------------------------------------------------
 MIN_DURATION_S = 0.5
 
-# 30 s = hard cap del API Gateway HTTP API (integration timeout). Si dejamos
-# pasar audios mas largos, Lambda los procesa pero API Gateway corta antes
-# de recibir la respuesta y el usuario ve "timeout" generico en vez de un
-# mensaje accionable. Si algun dia migramos a REST API (cap 29 s) o async,
-# revisar este numero.
-MAX_DURATION_S = 30.0
+# Fase 3 (2026-05-18): subimos de 30 a 90 s.
+# Antes (Fase 1/2): 30 s era hard cap del API Gateway HTTP API porque el
+# audio viajaba en el body del POST (base64) y el integration timeout cortaba
+# requests largos. Con Fase 3 (S3 presigned URLs) el audio NO pasa por API GW,
+# asi que ese cap desaparecio.
+# 90 s es decision conservadora: audios XC tipicos son 10-30 s, 90 cubre 99%
+# de casos reales. Audios mas largos aumentan probabilidad de multi-species
+# overlap. Subir threshold con evidencia es facil; bajarlo despues que los
+# usuarios se acostumbraron es feo.
+MAX_DURATION_S = 90.0
 
-MAX_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+# Fase 3: subimos de 5 MB a 15 MB. Suficiente para 90 s de mp3 192 kbps (~4 MB)
+# y para wav 48 kHz 90 s (~17 MB ya no entra, asumimos usuario sube mp3 o
+# wav corto). Bound por seguridad anti-spam, no por arquitectura (S3 PUT no
+# tiene este limite).
+MAX_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB
 MIN_SAMPLE_RATE_HZ = 8_000
 MAX_CHANNELS = 2
 
@@ -62,8 +70,8 @@ _MUTAGEN_FORMAT_MAP = {
 # ---------------------------------------------------------------------------
 _MESSAGES = {
     "too_short": "El audio es muy corto (menos de 0.5 s). Subi uno mas largo.",
-    "too_long": "El audio supera los 30 s. Recortalo antes de subirlo.",
-    "too_big": "El archivo pesa mas de 5 MB. Subi uno mas chico.",
+    "too_long": "El audio supera los 90 s. Recortalo antes de subirlo.",
+    "too_big": "El archivo pesa mas de 15 MB. Subi uno mas chico.",
     "unsupported_format": (
         "Formato no soportado. Subi un archivo mp3, wav, ogg o flac."
     ),
