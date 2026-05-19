@@ -105,6 +105,12 @@ train(config_overrides={"epochs": 50})
 
 Los `scripts/` son one-shots reproducibles desde CLI (descargar dataset, exportar ONNX, limpiar runs de W&B). Lo que se ejecuta en producción vive en `lambda/` (inferencia) y `app/` (frontend).
 
+## Security & Privacy
+
+- **Encryption at rest:** DynamoDB y S3 cifran con AWS-managed keys por default. No se almacenan datos en claro.
+- **IAM least-privilege:** el role del Lambda tiene acceso scoped a recursos específicos — tabla `bird-classifier-py-data` y su GSI `by_result_status_and_time` (acciones limitadas a `PutItem`, `UpdateItem`, `GetItem`, `Query`), más el prefijo `s3://conocetuave-py-uploads/uploads/*`. No hay policies wildcard de cuenta.
+- **Sin PII en keys:** la tabla usa partition keys genéricas (`pk`/`sk` con prefijos `PRED#<uuid>`, `RATE#<fingerprint>`). El fingerprint es un UUID4 anónimo por sesión, no contiene email, IP ni user-agent.
+
 ## Status
 
 - [ ] **Fase 0** — Scaffolding del repo
