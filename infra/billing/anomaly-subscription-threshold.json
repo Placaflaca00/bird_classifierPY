@@ -1,0 +1,18 @@
+{
+  "Or": [
+    {
+      "Dimensions": {
+        "Key": "ANOMALY_TOTAL_IMPACT_ABSOLUTE",
+        "Values": ["1.0"],
+        "MatchOptions": ["GREATER_THAN_OR_EQUAL"]
+      }
+    },
+    {
+      "Dimensions": {
+        "Key": "ANOMALY_TOTAL_IMPACT_PERCENTAGE",
+        "Values": ["10.0"],
+        "MatchOptions": ["GREATER_THAN_OR_EQUAL"]
+      }
+    }
+  ]
+}
