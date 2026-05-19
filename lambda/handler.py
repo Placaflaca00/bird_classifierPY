@@ -24,7 +24,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from os import getenv
 from pathlib import Path
 from typing import Any
@@ -257,6 +257,30 @@ _S3_CLIENT = boto3.client(
     config=Config(signature_version="s3v4"),
 )
 
+# DynamoDB resource module-level: reuse entre invocations evita ~50-150 ms
+# de init en cold start. Resource (no client) porque ofrece mejor DX para
+# CRUD comun: sin {"S": ...}/{"N": ...} DynamoDB-JSON manual boilerplate,
+# tipos Python nativos. Performance overhead vs client es negligible
+# (~10 ms, irrelevante contra los 150ms de la inferencia ML).
+#
+# Config con adaptive retry: maneja throttling de DynamoDB mejor que
+# defaults. connect_timeout/read_timeout previene Lambdas que se cuelgan
+# esperando responses de DDB.
+#
+# Sin Config(signature_version="s3v4") — DynamoDB no firma presigned URLs,
+# usa el default boto3. Agregarlo confundiría a un lector futuro asumiendo
+# que hay una razon especial.
+_DDB_RESOURCE = boto3.resource(
+    "dynamodb",
+    region_name="us-east-1",
+    config=Config(
+        retries={"max_attempts": 3, "mode": "adaptive"},
+        connect_timeout=5,
+        read_timeout=10,
+    ),
+)
+_DDB_TABLE = _DDB_RESOURCE.Table(DYNAMODB_TABLE_NAME)
+
 
 # ---------------------------------------------------------------------------
 # Inferencia
@@ -483,6 +507,116 @@ def _read_audio_from_s3(s3_key: str) -> bytes:
         raise ValueError("s3_key inválido: formato no reconocido")
     obj = _S3_CLIENT.get_object(Bucket=S3_UPLOADS_BUCKET, Key=s3_key)
     return obj["Body"].read()
+
+
+# ---------------------------------------------------------------------------
+# Fase 4: DynamoDB writes (rate limit + prediction logging)
+# ---------------------------------------------------------------------------
+def _check_and_increment_rate_limit(fingerprint: str) -> tuple[bool, dict]:
+    """Rate limit atomico server-side por fingerprint via UpdateItem condicional.
+
+    Devuelve (passed, info):
+
+    passed=True (request OK, count incrementado):
+        info = {
+            "requests_today": <count tras este request, 1..DAILY_REQUEST_LIMIT>,
+            "limit": DAILY_REQUEST_LIMIT,
+            "remaining": DAILY_REQUEST_LIMIT - requests_today,
+        }
+
+    passed=False (limite excedido, sin incremento):
+        info = {
+            "requests_today": <count actual, == DAILY_REQUEST_LIMIT>,
+            "limit": DAILY_REQUEST_LIMIT,
+            "remaining": 0,
+            "reset_at": "YYYY-MM-DDT00:00:00Z",   # proxima medianoche UTC
+        }
+
+    fail-open (DDB unavailable, error != ConditionalCheckFailed):
+        info = {"degraded": True, "limit": DAILY_REQUEST_LIMIT}
+
+    Atomico server-side. La ConditionExpression `request_count < :limit` permite
+    EXACTAMENTE DAILY_REQUEST_LIMIT requests/dia (29<30 OK -> count=30;
+    30<30 falla -> 429). Off-by-one consciente, documentado en la constante.
+
+    Reset diario viene del sk DAY#<today_utc> (key cambia cada dia UTC), NO
+    del TTL. UTC end-to-end elimina ambiguedad cross-timezone — un user a las
+    23:30 ART (02:30 UTC del dia siguiente) ve reset_at consistente con el
+    sort key que el backend acaba de usar.
+
+    Truco para devolver `requests_today` en el reject sin GetItem extra:
+    ReturnValuesOnConditionCheckFailure="ALL_OLD" hace que DDB incluya el
+    item existente en el error response cuando la condition falla. Misma
+    operacion, info gratis (botocore >=1.31.55; pinneado en requirements.txt
+    a 1.43.9 para parity tests-local <-> Docker).
+
+    Fail-open: errores != ConditionalCheckFailed dejan pasar la request
+    (log WARN). Rate limit es proteccion anti-abuso, no fraud prevention.
+    Mejor servir legitimas que cortar por un blip DDB.
+
+    Aliasing TODOS los attribute names (best practice defensiva): ttl y
+    date son reserved keywords; count/fp/itype no — pero aliasing uniforme
+    evita bugs si renombramos atributos al futuro.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today = now_utc.strftime("%Y-%m-%d")
+    ttl_unix = int(time.time()) + RATE_LIMIT_TTL_SECONDS
+    try:
+        response = _DDB_TABLE.update_item(
+            Key={"pk": f"RATE#{fingerprint}", "sk": f"DAY#{today}"},
+            UpdateExpression=(
+                "ADD #count :one "
+                "SET #ttl = if_not_exists(#ttl, :ttl_val), "
+                "#fp = :fp, #date = :date, #itype = :itype"
+            ),
+            ConditionExpression="attribute_not_exists(#count) OR #count < :limit",
+            ExpressionAttributeNames={
+                "#count": "request_count",
+                "#ttl": "ttl",
+                "#fp": "fingerprint",
+                "#date": "date",
+                "#itype": "item_type",
+            },
+            ExpressionAttributeValues={
+                ":one": 1,
+                ":limit": DAILY_REQUEST_LIMIT,
+                ":ttl_val": ttl_unix,
+                ":fp": fingerprint,
+                ":date": today,
+                ":itype": "RATE_LIMIT",
+            },
+            ReturnValues="UPDATED_NEW",
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+        new_count = int(response["Attributes"]["request_count"])
+        return True, {
+            "requests_today": new_count,
+            "limit": DAILY_REQUEST_LIMIT,
+            "remaining": DAILY_REQUEST_LIMIT - new_count,
+        }
+    except _DDB_TABLE.meta.client.exceptions.ConditionalCheckFailedException as e:
+        # DDB devuelve el item viejo en e.response["Item"] gracias a
+        # ReturnValuesOnConditionCheckFailure="ALL_OLD". Item viene con
+        # tipos resource (Decimal para numbers).
+        existing = e.response.get("Item", {})
+        current_count = int(existing.get("request_count", DAILY_REQUEST_LIMIT))
+        reset_at = (now_utc + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        return False, {
+            "requests_today": current_count,
+            "limit": DAILY_REQUEST_LIMIT,
+            "remaining": 0,
+            "reset_at": reset_at,
+        }
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Rate limit check fallo (fail-open)",
+            extra={
+                "error_type": type(e).__name__,
+                "error_msg": str(e),
+                "fingerprint": fingerprint,
+            },
+        )
+        return True, {"degraded": True, "limit": DAILY_REQUEST_LIMIT}
 
 
 # ---------------------------------------------------------------------------

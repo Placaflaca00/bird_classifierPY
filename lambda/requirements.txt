@@ -16,3 +16,14 @@ soundfile==0.13.1
 
 # Bound de numpy: onnxruntime 1.26 soporta numpy 2.x.
 numpy>=2.0,<3
+
+# AWS SDK (Fase 4): pinned >=1.31.55 para ReturnValuesOnConditionCheckFailure
+# (usado en _check_and_increment_rate_limit para devolver requests_today en
+# rejects sin GetItem extra). Pin exacto a versión del venv para parity
+# tests-local <-> Docker. boto3 ya viene en el base image AWS Lambda Python
+# 3.12 pero NO garantiza versión — pip upgradea al instalar este.
+boto3==1.43.9
+# Bound a versión exacta de la imagen Docker (1.43.9 < 1.43.10 = drift de patch).
+# Aunque drift de patch es bajo riesgo, pin exacto mantiene parity completa
+# tests-local <-> container <-> Lambda runtime.
+botocore==1.43.9
