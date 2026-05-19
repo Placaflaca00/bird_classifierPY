@@ -20,16 +20,30 @@ from __future__ import annotations
 import base64
 import io
 import json
-import os
+import logging
 import re
 import time
 import uuid
+from datetime import datetime, timezone
+from os import getenv
 from pathlib import Path
 from typing import Any
 
 import boto3
 import numpy as np
 from botocore.client import Config
+
+# ---------------------------------------------------------------------------
+# Logger module-level
+# ---------------------------------------------------------------------------
+# Level desde env var permite ajustar verbosidad en produccion sin rebuild
+# Docker. Setear LAMBDA_LOG_LEVEL=DEBUG via update-function-configuration para
+# debugging temporal; vuelve a INFO con otro update-function-configuration.
+# JSON log format se configura en la function config (LogFormat=JSON), no aca.
+logger = logging.getLogger()
+log_level = getenv("LAMBDA_LOG_LEVEL", "INFO")
+logger.setLevel(logging.getLevelName(log_level))
+
 
 # ---------------------------------------------------------------------------
 # Constantes y rutas
@@ -53,6 +67,19 @@ EMBEDDING_DIM = 1024
 MODEL_VERSION = "classifier_v1"  # bump en cada retrain; documentar en ADR
 
 DEFAULT_TOP_K = 3
+
+# Fase 4: DynamoDB para logging predictions + rate limit por fingerprint.
+# Reset diario del rate limit viene del sk "DAY#<today>" (key cambia cada
+# dia UTC), NO del TTL — TTL es solo cleanup y AWS no garantiza inmediato
+# (puede tardar hasta 48h en borrar items expirados).
+DYNAMODB_TABLE_NAME = "bird-classifier-py-data"
+DAILY_REQUEST_LIMIT = 30  # permite EXACTAMENTE 30 requests/dia (29<30 OK; 30<30 falla)
+RATE_LIMIT_TTL_SECONDS = 24 * 3600
+PREDICTION_TTL_SECONDS = 90 * 24 * 3600
+# Fingerprint pattern estricto: fp_ + 32 hex chars exactos (match uuid4().hex).
+# UX-grade rate limiting, no security boundary — atacante motivado rota
+# localStorage. Documentar en README.
+FINGERPRINT_PATTERN = re.compile(r"^fp_[0-9a-f]{32}$")
 
 # Fase 3: S3 presigned URLs para audios largos (cap 30s del API GW desaparece
 # cuando el browser sube directo a S3 y manda solo el s3_key al /predict).
