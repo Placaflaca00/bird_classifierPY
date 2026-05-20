@@ -674,7 +674,13 @@ def _write_prediction_item(
     """
     item: dict[str, Any] = {
         "pk": f"PRED#{prediction_id}",
-        "sk": f"PRED#{timestamp_iso}",
+        # sk constante: pk (UUID4) ya es globalmente unico — 1 item por
+        # particion, sin jerarquia. El timestamp vive como atributo top-level
+        # (y como sort key del GSI), no aporta nada en la composite key.
+        # "META" (label categorico) deja la particion abierta a sub-items
+        # futuros (sk="AUDIT#...", etc.) y habilita el UpdateItem de /feedback
+        # (Fase 4c) con solo pk + sk literal, sin Query previo.
+        "sk": "META",
         "item_type": "PREDICTION",
         "prediction_id": prediction_id,
         "timestamp": timestamp_iso,
