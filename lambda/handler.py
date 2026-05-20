@@ -25,6 +25,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from os import getenv
 from pathlib import Path
 from typing import Any
@@ -617,6 +618,121 @@ def _check_and_increment_rate_limit(fingerprint: str) -> tuple[bool, dict]:
             },
         )
         return True, {"degraded": True, "limit": DAILY_REQUEST_LIMIT}
+
+
+def _write_prediction_item(
+    prediction_id: str,
+    fingerprint: str,
+    timestamp_iso: str,
+    result_status: str,
+    top_predictions: list[dict[str, Any]] | None,
+    max_birdnet_confidence: float | None,
+    inference_time_ms: float,
+    n_windows: int | None,
+    audio_duration_s: float,
+    audio_size_bytes: int,
+    s3_key: str | None,
+    training_consent: bool,
+) -> bool:
+    """Escribe un item PREDICTION en DynamoDB — un row por request a /predict.
+
+    Cubre los 3 desenlaces del pipeline: detected (con top-3), rechazos del
+    pre-filter sintetico (white_noise / pure_tone) y rechazo del gate BirdNET
+    (not_a_bird). Los campos opcionales (top_*, max_birdnet_confidence,
+    n_windows, s3_key) se OMITEN del item cuando no aplican — DynamoDB no
+    necesita placeholders y omitir es mas barato que escribir NULL.
+
+    Floats -> Decimal: el resource API de DynamoDB NO acepta float (levanta
+    "Float types are not supported"). Patron `Decimal(str(round(x, n)))`: el
+    round acota a la precision significativa y el paso por str evita arrastrar
+    ruido binario de float64 (Decimal(0.1) != Decimal("0.1")). Los ints
+    (audio_size_bytes, n_windows, ttl) son nativos, no se convierten.
+
+    Idempotency: `ConditionExpression="attribute_not_exists(pk)"`. Si Lambda
+    reintenta la misma invocacion, el segundo PutItem falla silente (INFO, no
+    ERROR) en vez de duplicar el row o pisar feedback/review ya escritos.
+
+    review_status="pending": todo item nace pendiente de revision humana. El
+    annotation tool human-in-the-loop (Fase 5) lo transiciona a approved/
+    rejected/skipped. El feedback de usuarios (feedback_status) NO promueve
+    audio a training automaticamente — pasa por esa revision primero.
+
+    Fail-LOUD (a diferencia de `_check_and_increment_rate_limit`, que es
+    fail-open/WARN): un PutItem fallido se loguea a ERROR. Perder un item es
+    perder data del dashboard Fase 5 y del pool de active learning, y queremos
+    enterarnos (alarmable en CloudWatch Logs). NO re-lanza: la clasificacion ya
+    fue exitosa y el usuario debe recibir su 200; romper la respuesta por un
+    write de side-effect seria una regresion de UX.
+
+    Returns:
+        True  si el item se persistio, o si ya existia (ConditionalCheckFailed
+              por la guarda de idempotency cuenta como exito — la prediccion ya
+              quedo registrada).
+        False si hubo un error de escritura distinto de ConditionalCheckFailed.
+        El caller (Step 2.e) puede agregar el bool para trackear write success
+        rate; Fase 5 lo expone como "% predictions successfully persisted".
+    """
+    item: dict[str, Any] = {
+        "pk": f"PRED#{prediction_id}",
+        "sk": f"PRED#{timestamp_iso}",
+        "item_type": "PREDICTION",
+        "prediction_id": prediction_id,
+        "timestamp": timestamp_iso,
+        "fingerprint": fingerprint,
+        "result_status": result_status,
+        "inference_time_ms": Decimal(str(round(inference_time_ms, 2))),
+        "audio_duration_s": Decimal(str(round(audio_duration_s, 2))),
+        "audio_size_bytes": audio_size_bytes,
+        "model_version": MODEL_VERSION,
+        "training_consent": training_consent,
+        "feedback_status": "none",
+        "review_status": "pending",
+        "ttl": int(time.time()) + PREDICTION_TTL_SECONDS,
+    }
+    if s3_key is not None:
+        item["s3_key"] = s3_key
+    if n_windows is not None:
+        item["n_windows"] = n_windows
+    if max_birdnet_confidence is not None:
+        item["max_birdnet_confidence"] = Decimal(str(round(max_birdnet_confidence, 4)))
+    if top_predictions:
+        top1 = top_predictions[0]
+        item["top1_species"] = top1["species"]
+        item["top1_confidence"] = Decimal(str(round(top1["confidence"], 4)))
+        item["top3_predictions"] = [
+            {
+                "species": p["species"],
+                "common_name": p.get("common_name"),
+                "confidence": Decimal(str(round(p["confidence"], 4))),
+            }
+            for p in top_predictions[:3]
+        ]
+
+    try:
+        _DDB_TABLE.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(pk)",
+        )
+        return True
+    except _DDB_TABLE.meta.client.exceptions.ConditionalCheckFailedException:
+        # Reintento de Lambda sobre la misma invocacion: el item ya existe.
+        # No es error — la prediccion ya quedo registrada (idempotency = exito).
+        logger.info(
+            "PutItem idempotente: prediction_id ya existe, no se reescribe",
+            extra={"prediction_id": prediction_id},
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.error(
+            "PutItem PREDICTION fallo — item perdido (fail-loud)",
+            extra={
+                "prediction_id": prediction_id,
+                "result_status": result_status,
+                "error_type": type(e).__name__,
+                "error_msg": str(e),
+            },
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
