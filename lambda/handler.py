@@ -248,6 +248,15 @@ _CLASSIFIER_SESS, _IDX_TO_SPECIES, _CLASSIFIER_META = _load_classifier()
 _SPECIES_META = _load_species_metadata()
 _NUM_CLASSES = len(_IDX_TO_SPECIES)
 
+# Fase 4c — constantes de validacion del endpoint /feedback.
+# _FEEDBACK_ACTIONS: discriminator del body (patron OpenAPI oneOf); cada valor
+#   define que campos extra son validos (ver _handle_feedback).
+# _VALID_SPECIES: especies aceptables como corrected_species. Derivado del
+#   modelo cargado — NO hardcodear: si el classifier se reentrena con otro set
+#   de clases, esto lo sigue automaticamente.
+_FEEDBACK_ACTIONS = frozenset({"confirmed", "corrected", "rejected_as_non_bird"})
+_VALID_SPECIES = frozenset(_IDX_TO_SPECIES.values())
+
 # boto3 S3 client module-level: reuse entre invocations (cold start cost
 # solo la primera). Sigv4 + region explicita: sin esto, S3 puede devolver
 # 307 Temporary Redirect que el browser no sigue en PUTs presigned
@@ -797,17 +806,20 @@ def handler(event: dict, context: Any = None) -> dict:
 
     Rutas (API Gateway HTTP API v2 envia `rawPath`):
         POST /upload-url   -> presigned PUT URL para subir audio a S3
+        POST /feedback     -> aplica feedback del usuario a una prediccion
         POST /predict      -> clasifica audio (default si rawPath ausente, para
                               preservar compat con tests directos sin event API GW)
 
     El refactor a routing (Fase 3) en vez de un solo handler mantiene la
-    misma Lambda function ARN — API Gateway routea 2 paths al mismo Lambda
-    y nosotros despachamos internamente. Mas barato que 2 Lambdas separadas
+    misma Lambda function ARN — API Gateway routea 3 paths al mismo Lambda
+    y nosotros despachamos internamente. Mas barato que 3 Lambdas separadas
     (sin cold start duplicado).
     """
     raw_path = event.get("rawPath") or event.get("path") or ""
     if raw_path.endswith("/upload-url"):
         return _handle_upload_url(event)
+    if raw_path.endswith("/feedback"):
+        return _handle_feedback(event)
     return _handle_predict(event)
 
 
@@ -1042,6 +1054,178 @@ def _handle_predict(event: dict) -> dict:
         "inference_time_ms": round(inference_ms, 2),
         "max_birdnet_confidence": round(max_birdnet_confidence, 4),
     }, prediction_id=prediction_id, rate_info=rate_info)
+
+
+def _handle_feedback(event: dict) -> dict:
+    """POST /feedback -> aplica feedback del usuario a una predicción.
+
+    Validation pattern: OpenAPI discriminator (`action`) con oneOf schema
+    variants. Cada valor de `action` define qué campos adicionales son
+    válidos:
+    - "confirmed": sin corrected_species.
+    - "corrected": corrected_species requerido, debe estar en las 20 especies.
+    - "rejected_as_non_bird": sin corrected_species.
+
+    Combinaciones inválidas (ej. corrected_species con action="confirmed")
+    se rechazan con 400. Campos extra desconocidos se ignoran silenciosamente.
+
+    Body schema:
+        {"prediction_id": "<uuid4>", "fingerprint": "fp_<32hex>",
+         "action": "confirmed" | "corrected" | "rejected_as_non_bird",
+         "corrected_species": "<especie>"}   # solo si action == "corrected"
+
+    Efecto: UpdateItem sobre el item PREDICTION existente — Key pk + sk="META"
+    (ver Schema decision 4c). Setea feedback_status, feedback_timestamp y, si
+    aplica, feedback_corrected_species.
+
+    Idempotency: ConditionExpression `attribute_exists(pk) AND feedback_status
+    = "none"` — un PREDICTION acepta feedback UNA sola vez. Nota de semántica:
+    `attribute_exists(pk)` NO significa "existe algún item con ese pk"; evalúa
+    sobre el item de la Key EXACTA (pk + sk="META"). Como cada prediction_id
+    tiene exactamente un item (sk constante), la semántica es la deseada.
+
+    Responses:
+        200  feedback aplicado.
+        400  body inválido (parse / prediction_id / fingerprint / action /
+             corrected_species).
+        404  prediction_id no corresponde a ninguna predicción.
+        409  esa predicción ya tiene feedback (doble submit).
+        500  error de DynamoDB, o item PREDICTION malformado (sin
+             feedback_status) — ambos son bugs del backend, logueados a ERROR.
+
+    El 404 / 409 / 500-malformado se disambiguan con
+    ReturnValuesOnConditionCheckFailure="ALL_OLD": el error de condición trae
+    el item viejo SOLO si existía. Sin item -> 404. Con item y feedback_status
+    presente -> 409. Con item pero sin feedback_status -> schema drift -> 500.
+    ⚠️ Ese item viejo viene en DynamoDB-JSON CRUDO (values {"S": ...}/{"N":
+    ...}; keys planas), NO deserializado por el resource API — quirk de la
+    excepción, verificado empíricamente. De ahí los accesos `.get("feedback_
+    status", {}).get("S")`.
+    """
+    # --- Parse & validate body ---------------------------------------------
+    try:
+        body = _parse_body(event)
+    except ValueError as e:
+        return _response(400, {"error": str(e)})
+
+    prediction_id = body.get("prediction_id")
+    if not isinstance(prediction_id, str):
+        return _response(400, {"error": "prediction_id faltante o no es string"})
+    try:
+        parsed_uuid = uuid.UUID(prediction_id)
+    except ValueError:
+        return _response(400, {"error": "prediction_id no es un UUID válido"})
+    if parsed_uuid.version != 4 or str(parsed_uuid) != prediction_id:
+        return _response(400, {
+            "error": "prediction_id debe ser un UUID4 en formato canónico"
+        })
+
+    # fingerprint: se valida por consistencia de contrato con /predict, pero
+    # NO se cruza contra el de la predicción — el feedback no es un límite de
+    # seguridad y la ConditionExpression deliberadamente no lo incluye.
+    fingerprint = body.get("fingerprint")
+    if not isinstance(fingerprint, str) or not FINGERPRINT_PATTERN.match(fingerprint):
+        return _response(400, {
+            "error": "fingerprint faltante o inválido "
+                     "(esperado 'fp_' + 32 caracteres hex)"
+        })
+
+    action = body.get("action")
+    if action not in _FEEDBACK_ACTIONS:
+        return _response(400, {
+            "error": "action inválido "
+                     "(esperado: confirmed | corrected | rejected_as_non_bird)"
+        })
+
+    # corrected_species discriminado por `action`. JSON null se trata como
+    # ausente (None). Matriz de validación 4c (discriminator oneOf).
+    corrected_species = body.get("corrected_species")
+    if action == "corrected":
+        if corrected_species is None:
+            return _response(400, {
+                "error": "corrected_species requerido para action='corrected'"
+            })
+        if corrected_species not in _VALID_SPECIES:
+            return _response(400, {
+                "error": "corrected_species no es una especie soportada"
+            })
+    elif corrected_species is not None:
+        return _response(400, {
+            "error": f"corrected_species no aplica a action='{action}'"
+        })
+
+    # --- UpdateItem sobre el item PREDICTION existente ---------------------
+    # Alias de TODOS los attribute names (best practice del proyecto, aunque
+    # ninguno sea reserved keyword). :none se usa solo en la ConditionExpression.
+    feedback_ts = datetime.now(timezone.utc).isoformat()
+    update_expr = "SET #fstatus = :status, #fts = :ts"
+    expr_names = {"#fstatus": "feedback_status", "#fts": "feedback_timestamp"}
+    expr_values = {":status": action, ":ts": feedback_ts, ":none": "none"}
+    if action == "corrected":
+        update_expr += ", #fcs = :cs"
+        expr_names["#fcs"] = "feedback_corrected_species"
+        expr_values[":cs"] = corrected_species
+
+    try:
+        _DDB_TABLE.update_item(
+            Key={"pk": f"PRED#{prediction_id}", "sk": "META"},
+            UpdateExpression=update_expr,
+            ConditionExpression="attribute_exists(pk) AND #fstatus = :none",
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_values,
+            ReturnValuesOnConditionCheckFailure="ALL_OLD",
+        )
+    except _DDB_TABLE.meta.client.exceptions.ConditionalCheckFailedException as e:
+        # ALL_OLD: el error trae "Item" SOLO si el item existía, en DynamoDB-JSON
+        # CRUDO (las VALUES son {"S": ...}/{"N": ...}; las KEYS, planas).
+        old_item = e.response.get("Item")
+
+        # Caso 1: no existía ningún item con esa Key -> 404.
+        if not old_item:
+            return _response(404, {"error": "prediction_id no encontrado"})
+
+        # Caso 2: existe pero sin feedback_status. _write_prediction_item SIEMPRE
+        # lo escribe ("none") -> si falta, es schema drift / bug del backend, no
+        # error del usuario. Log a ERROR (alarmable), 500 al cliente.
+        if "feedback_status" not in old_item:
+            logger.error(
+                "Item PREDICTION malformado: feedback_status ausente",
+                extra={
+                    "prediction_id": prediction_id,
+                    "old_item_keys": list(old_item.keys()),
+                },
+            )
+            return _response(500, {
+                "error": "estado de la predicción inconsistente"
+            })
+
+        # Caso 3: existe con feedback_status != "none" -> ya tiene feedback.
+        # current_status le dice al frontend qué quedó registrado.
+        return _response(409, {
+            "error": "esta predicción ya tiene feedback registrado",
+            "current_status": old_item.get("feedback_status", {}).get("S", "unknown"),
+        })
+    except Exception as e:  # noqa: BLE001
+        # Fail-loud: un error real de DynamoDB se loguea a ERROR (alarmable en
+        # CloudWatch). A diferencia del write best-effort de /predict, acá el
+        # feedback ES la operación pedida — si falla, el usuario recibe 500.
+        logger.error(
+            "UpdateItem /feedback falló",
+            extra={
+                "prediction_id": prediction_id,
+                "action": action,
+                "error_type": type(e).__name__,
+                "error_msg": str(e),
+            },
+        )
+        return _response(500, {
+            "error": f"no se pudo registrar el feedback: {type(e).__name__}"
+        })
+
+    payload = {"prediction_id": prediction_id, "feedback_status": action}
+    if action == "corrected":
+        payload["feedback_corrected_species"] = corrected_species
+    return _response(200, payload)
 
 
 # ---------------------------------------------------------------------------

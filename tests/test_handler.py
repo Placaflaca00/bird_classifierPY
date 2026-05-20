@@ -33,6 +33,7 @@ import handler as h  # noqa: E402
 # Fase 4 — helpers y fixtures compartidos (rate limit + writes a DynamoDB)
 # ===========================================================================
 _VALID_FP = "fp_" + "a" * 32
+_VALID_PRED_ID = "12345678-1234-4234-8234-123456789abc"  # UUID4 canonico (v4, variant 8)
 _AUDIO_B64 = base64.b64encode(b"fake-audio-bytes").decode("ascii")
 
 _TOP3 = [
@@ -56,6 +57,24 @@ def _predict_event(**overrides):
     body.update(overrides)
     body = {k: v for k, v in body.items() if v is not None}
     return {"rawPath": "/predict", "body": json.dumps(body)}
+
+
+def _feedback_event(**overrides):
+    """Construye un event API GW para /feedback.
+
+    Por default incluye prediction_id + fingerprint + action='confirmed'
+    validos. Pasar un campo en None lo OMITE del body (para testear
+    validacion); cualquier otro kwarg (corrected_species, etc.) se agrega
+    tal cual.
+    """
+    body = {
+        "prediction_id": _VALID_PRED_ID,
+        "fingerprint": _VALID_FP,
+        "action": "confirmed",
+    }
+    body.update(overrides)
+    body = {k: v for k, v in body.items() if v is not None}
+    return {"rawPath": "/feedback", "body": json.dumps(body)}
 
 
 @pytest.fixture
@@ -704,3 +723,189 @@ class TestPredictFase4:
         assert resp["statusCode"] == 200
         item = mock_ddb.put_item.call_args.kwargs["Item"]
         assert item["training_consent"] is expected
+
+
+# ---------------------------------------------------------------------------
+# Fase 4c: _handle_feedback — endpoint /feedback
+# ---------------------------------------------------------------------------
+class TestFeedback:
+    """Endpoint POST /feedback: validacion discriminator (action), UpdateItem
+    sobre el PREDICTION existente, y mapeo de errores 400/404/409/500.
+
+    _DDB_TABLE esta mockeado (fixture mock_ddb) — cero AWS. El item viejo que
+    DynamoDB devuelve en ConditionalCheckFailedException se mockea en formato
+    DynamoDB-JSON CRUDO ({"S": ...}/{"N": ...}), fiel al comportamiento real
+    del resource API verificado empiricamente — NO en formato deserializado.
+    """
+
+    # --- Routing -----------------------------------------------------------
+    def test_routing_despacha_a_handle_feedback(self, mock_ddb):
+        """rawPath /feedback -> _handle_feedback (no _handle_predict, que
+        habria exigido audio_b64/s3_key y devuelto 400)."""
+        resp = h.handler(_feedback_event())
+        assert resp["statusCode"] == 200
+        mock_ddb.update_item.assert_called_once()
+
+    # --- Fase 1: validacion de body ----------------------------------------
+    def test_body_no_json_devuelve_400(self, mock_ddb):
+        """body que no es JSON valido -> 400, sin tocar DynamoDB."""
+        resp = h.handler({"rawPath": "/feedback", "body": "{ no es json"})
+        assert resp["statusCode"] == 400
+        mock_ddb.update_item.assert_not_called()
+
+    @pytest.mark.parametrize("bad_pid", [
+        None,                                      # ausente / no string
+        "not-a-uuid",                              # no parseable
+        "12345678123442348234123456789abc",        # v4 pero sin guiones (no canonico)
+        "ABCDEF12-1234-4234-8234-123456789ABC",    # mayusculas (no canonico)
+        str(uuid.uuid1()),                         # UUID v1, no v4
+    ])
+    def test_prediction_id_invalido_devuelve_400(self, mock_ddb, bad_pid):
+        """prediction_id que no es UUID4 canonico -> 400, sin UpdateItem."""
+        resp = h.handler(_feedback_event(prediction_id=bad_pid))
+        assert resp["statusCode"] == 400
+        assert "prediction_id" in json.loads(resp["body"])["error"]
+        mock_ddb.update_item.assert_not_called()
+
+    @pytest.mark.parametrize("bad_fp", [
+        None,                    # ausente
+        "fp_xyz",                # muy corto
+        "FP_" + "a" * 32,        # prefijo mayuscula
+        "abc123",                # sin prefijo
+    ])
+    def test_fingerprint_invalido_devuelve_400(self, mock_ddb, bad_fp):
+        """fingerprint que no matchea ^fp_[0-9a-f]{32}$ -> 400."""
+        resp = h.handler(_feedback_event(fingerprint=bad_fp))
+        assert resp["statusCode"] == 400
+        assert "fingerprint" in json.loads(resp["body"])["error"]
+        mock_ddb.update_item.assert_not_called()
+
+    @pytest.mark.parametrize("bad_action", [None, "confirm", "rejected", "", 42])
+    def test_action_invalido_devuelve_400(self, mock_ddb, bad_action):
+        """action fuera del enum discriminator -> 400."""
+        resp = h.handler(_feedback_event(action=bad_action))
+        assert resp["statusCode"] == 400
+        assert "action" in json.loads(resp["body"])["error"]
+        mock_ddb.update_item.assert_not_called()
+
+    # --- Matriz discriminator: action x corrected_species ------------------
+    @pytest.mark.parametrize("action,corrected,status,err_substr", [
+        ("confirmed",            None,            200, None),
+        ("confirmed",            "VALID",         400, "no aplica"),
+        ("corrected",            None,            400, "requerido"),
+        ("corrected",            "VALID",         200, None),
+        ("corrected",            "no_es_especie", 400, "no es una especie"),
+        ("rejected_as_non_bird", None,            200, None),
+        ("rejected_as_non_bird", "VALID",         400, "no aplica"),
+    ])
+    def test_matriz_discriminator(self, mock_ddb, action, corrected,
+                                  status, err_substr):
+        """Patron OpenAPI oneOf: cada `action` define que corrected_species
+        es valido. Combinaciones invalidas -> 400 sin UpdateItem."""
+        species = next(iter(h._VALID_SPECIES)) if corrected == "VALID" else corrected
+        resp = h.handler(_feedback_event(action=action, corrected_species=species))
+        assert resp["statusCode"] == status
+        if status == 400:
+            assert err_substr in json.loads(resp["body"])["error"]
+            mock_ddb.update_item.assert_not_called()
+        else:
+            mock_ddb.update_item.assert_called_once()
+
+    def test_corrected_species_null_se_trata_como_ausente(self, mock_ddb):
+        """corrected_species: null explicito == ausente -> confirmed OK (200)."""
+        event = {"rawPath": "/feedback", "body": json.dumps({
+            "prediction_id": _VALID_PRED_ID, "fingerprint": _VALID_FP,
+            "action": "confirmed", "corrected_species": None,
+        })}
+        resp = h.handler(event)
+        assert resp["statusCode"] == 200
+        mock_ddb.update_item.assert_called_once()
+
+    # --- Happy paths: UpdateItem bien formado ------------------------------
+    @pytest.mark.parametrize("action", ["confirmed", "rejected_as_non_bird"])
+    def test_happy_path_sin_correccion(self, mock_ddb, action):
+        """confirmed / rejected_as_non_bird -> 200 + UpdateItem con Key
+        sk='META', ConditionExpression idempotente, SIN feedback_corrected_species."""
+        resp = h.handler(_feedback_event(action=action))
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["feedback_status"] == action
+        assert "feedback_corrected_species" not in body
+        kw = mock_ddb.update_item.call_args.kwargs
+        assert kw["Key"] == {"pk": f"PRED#{_VALID_PRED_ID}", "sk": "META"}
+        assert kw["ConditionExpression"] == \
+            "attribute_exists(pk) AND #fstatus = :none"
+        assert kw["ReturnValuesOnConditionCheckFailure"] == "ALL_OLD"
+        assert kw["ExpressionAttributeValues"][":status"] == action
+        assert kw["ExpressionAttributeValues"][":none"] == "none"
+        assert kw["ExpressionAttributeNames"]["#fstatus"] == "feedback_status"
+        assert "#fcs" not in kw["ExpressionAttributeNames"]
+        assert "#fcs" not in kw["UpdateExpression"]
+
+    def test_happy_path_corrected_incluye_correccion(self, mock_ddb):
+        """corrected -> 200 + UpdateItem con feedback_corrected_species."""
+        species = next(iter(h._VALID_SPECIES))
+        resp = h.handler(_feedback_event(action="corrected",
+                                         corrected_species=species))
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["feedback_status"] == "corrected"
+        assert body["feedback_corrected_species"] == species
+        kw = mock_ddb.update_item.call_args.kwargs
+        assert "#fcs = :cs" in kw["UpdateExpression"]
+        assert kw["ExpressionAttributeNames"]["#fcs"] == "feedback_corrected_species"
+        assert kw["ExpressionAttributeValues"][":cs"] == species
+
+    # --- ConditionalCheckFailed: 404 / 409 / 500-malformado ----------------
+    def test_prediction_inexistente_devuelve_404(self, mock_ddb, ccfe_class):
+        """CCFE sin 'Item' (ALL_OLD no devuelve nada si el item no existia)
+        -> 404."""
+        exc = ccfe_class("no existe")
+        exc.response = {}
+        mock_ddb.update_item.side_effect = exc
+        resp = h.handler(_feedback_event())
+        assert resp["statusCode"] == 404
+        assert "prediction_id" in json.loads(resp["body"])["error"]
+
+    def test_doble_feedback_devuelve_409_con_current_status(self, mock_ddb,
+                                                            ccfe_class):
+        """CCFE con 'Item' que ya tiene feedback_status != 'none' -> 409.
+        El body incluye current_status leido del Item DynamoDB-JSON crudo."""
+        exc = ccfe_class("ya tiene feedback")
+        exc.response = {"Item": {
+            "pk": {"S": f"PRED#{_VALID_PRED_ID}"},
+            "feedback_status": {"S": "confirmed"},
+        }}
+        mock_ddb.update_item.side_effect = exc
+        resp = h.handler(_feedback_event())
+        assert resp["statusCode"] == 409
+        assert json.loads(resp["body"])["current_status"] == "confirmed"
+
+    def test_item_malformado_sin_feedback_status_devuelve_500(self, mock_ddb,
+                                                              ccfe_class, caplog):
+        """CCFE con 'Item' presente pero SIN feedback_status (schema drift) ->
+        500 + log a ERROR (no es error del usuario, es bug del backend)."""
+        exc = ccfe_class("item raro")
+        exc.response = {"Item": {
+            "pk": {"S": f"PRED#{_VALID_PRED_ID}"},
+            "item_type": {"S": "PREDICTION"},
+        }}
+        mock_ddb.update_item.side_effect = exc
+        with caplog.at_level(logging.ERROR):
+            resp = h.handler(_feedback_event())
+        assert resp["statusCode"] == 500
+        assert any(
+            rec.levelname == "ERROR" and "malformado" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_ddb_error_generico_devuelve_500(self, mock_ddb, caplog):
+        """update_item raises excepcion generica -> 500 + log a ERROR."""
+        mock_ddb.update_item.side_effect = RuntimeError("simulated DDB failure")
+        with caplog.at_level(logging.ERROR):
+            resp = h.handler(_feedback_event())
+        assert resp["statusCode"] == 500
+        assert any(
+            rec.levelname == "ERROR" and "UpdateItem /feedback" in rec.getMessage()
+            for rec in caplog.records
+        )
