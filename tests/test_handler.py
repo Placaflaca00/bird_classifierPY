@@ -557,11 +557,15 @@ class TestPredictFase4:
         """update_item raises ConditionalCheckFailed -> 429 con rate_info,
         SIN prediction_id, sin escribir item PREDICTION."""
         exc = ccfe_class("limite excedido")
-        exc.response = {"Item": {"request_count": h.DAILY_REQUEST_LIMIT}}
+        # ConditionalCheckFailedException.response["Item"] viene en DynamoDB-JSON
+        # CRUDO ({"N": "<str>"}), NO deserializado — fiel al comportamiento real
+        # del resource API (verificado empiricamente, ver handler.py).
+        exc.response = {"Item": {"request_count": {"N": str(h.DAILY_REQUEST_LIMIT)}}}
         mock_ddb.update_item.side_effect = exc
         resp = h.handler(_predict_event())
         assert resp["statusCode"] == 429
         body = json.loads(resp["body"])
+        assert body["rate_info"]["requests_today"] == h.DAILY_REQUEST_LIMIT
         assert body["rate_info"]["remaining"] == 0
         assert "reset_at" in body["rate_info"]
         assert "prediction_id" not in body
@@ -670,7 +674,9 @@ class TestPredictFase4:
         El 429 lleva rate_info pero NO prediction_id."""
         if desenlace == "rate_limited":
             exc = ccfe_class("excedido")
-            exc.response = {"Item": {"request_count": h.DAILY_REQUEST_LIMIT}}
+            # Formato DynamoDB-JSON crudo, fiel al comportamiento real (ver
+            # test_rate_limit_excedido_devuelve_429).
+            exc.response = {"Item": {"request_count": {"N": str(h.DAILY_REQUEST_LIMIT)}}}
             mock_ddb.update_item.side_effect = exc
         else:
             _setup_desenlace(mock_pipeline, desenlace)

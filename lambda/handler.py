@@ -597,10 +597,14 @@ def _check_and_increment_rate_limit(fingerprint: str) -> tuple[bool, dict]:
         }
     except _DDB_TABLE.meta.client.exceptions.ConditionalCheckFailedException as e:
         # DDB devuelve el item viejo en e.response["Item"] gracias a
-        # ReturnValuesOnConditionCheckFailure="ALL_OLD". Item viene con
-        # tipos resource (Decimal para numbers).
+        # ReturnValuesOnConditionCheckFailure="ALL_OLD" — pero en DynamoDB-JSON
+        # CRUDO: los Number vienen como {"N": "<str>"}, NO int/Decimal. El
+        # deserializer del resource API solo aplica al output shape de la
+        # operacion, no al Item de este error. Verificado empiricamente
+        # (probe contra la tabla real, 2026-05-20).
         existing = e.response.get("Item", {})
-        current_count = int(existing.get("request_count", DAILY_REQUEST_LIMIT))
+        raw_count = existing.get("request_count", {})
+        current_count = int(raw_count.get("N", DAILY_REQUEST_LIMIT))
         reset_at = (now_utc + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
         return False, {
             "requests_today": current_count,
