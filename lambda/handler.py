@@ -760,6 +760,28 @@ def _response(status: int, payload: dict) -> dict:
     }
 
 
+def _predict_response(
+    status: int,
+    payload: dict,
+    *,
+    prediction_id: str | None = None,
+    rate_info: dict | None = None,
+) -> dict:
+    """Como `_response`, pero inyecta `prediction_id` y `rate_info` si existen.
+
+    El frontend (Fase 4c) lee `prediction_id` de cada respuesta de prediccion
+    para el endpoint /feedback, y `rate_info` para mostrar la cuota restante
+    debajo del boton. Ambos se omiten cuando todavia no existen en el flujo:
+    los 400 de validacion (Fase 1, previos al rate limit) no llevan ninguno;
+    el 429 lleva `rate_info` pero no `prediction_id` (ninguna prediccion ocurrio).
+    """
+    if prediction_id is not None:
+        payload["prediction_id"] = prediction_id
+    if rate_info is not None:
+        payload["rate_info"] = rate_info
+    return _response(status, payload)
+
+
 def handler(event: dict, context: Any = None) -> dict:
     """AWS Lambda entry point — routea por path.
 
@@ -810,13 +832,35 @@ def _handle_predict(event: dict) -> dict:
     """POST /predict -> clasifica audio.
 
     Body schema v1 (audio chico, base64 inline):
-        {"audio_b64": "<base64>", "top_k": 3}
+        {"audio_b64": "<base64>", "fingerprint": "fp_<32hex>",
+         "top_k": 3, "training_consent": false}
 
     Body schema v2 (Fase 3 — audios largos via S3):
-        {"s3_key": "uploads/<uuid4>.<ext>", "top_k": 3}
+        {"s3_key": "uploads/<uuid4>.<ext>", "fingerprint": "fp_<32hex>",
+         "top_k": 3, "training_consent": false}
 
-    Top-k clip a [1, num_classes]. Default 3.
+    Orden de operaciones (Fase 4 Step 2.e — validado vs AWS Lambda docs):
+        Fase 1  Parse & validate: body, top_k, fingerprint, audio source.
+        Fase 2  Rate limit: 429 si excedido — NO escribe ni consume nada mas.
+        Fase 3  Generar prediction_id + timestamp.
+        Fase 4  Adquirir (b64 / S3) + decodificar audio.
+        Fase 5  Pre-filter sintetico (Capa 1).
+        Fase 6  Gate BirdNET (Capa 2).
+        Fase 7  Clasificador ONNX (Capa 3).
+        Fase 8  Escribir item PREDICTION (side effect, fail-loud, 4 desenlaces).
+        Fase 9  Responder con prediction_id + rate_info.
+
+    El rate limit va DESPUES de validar input: un fingerprint malformado (bug
+    del frontend) no debe consumir cuota. Una vez pasado el rate limit, la
+    cuota YA se consumio — un fallo posterior (audio corrupto, etc.) NO la
+    devuelve. Anti-abuso intencional; no implementamos reserve+commit (ver
+    Future Work).
+
+    prediction_id va en toda respuesta desde Fase 3; rate_info desde Fase 2
+    (incluido el 429). Los 400 de Fase 1 no llevan ninguno. En errores de
+    Fase 4-7 el prediction_id es solo correlation ID (no se escribio item).
     """
+    # --- Fase 1: parse & validate ------------------------------------------
     try:
         body = _parse_body(event)
     except ValueError as e:
@@ -828,78 +872,166 @@ def _handle_predict(event: dict) -> dict:
     except (TypeError, ValueError):
         return _response(400, {"error": f"top_k inválido: {top_k_raw!r}"})
 
-    # Bifurcación audio_b64 / s3_key. Retrocompat: audio_b64 sigue funcionando
-    # para clientes que no quieran el round-trip extra de presigned URL.
-    if "audio_b64" in body:
+    fingerprint = body.get("fingerprint")
+    if not isinstance(fingerprint, str) or not FINGERPRINT_PATTERN.match(fingerprint):
+        return _response(400, {
+            "error": "fingerprint faltante o inválido "
+                     "(esperado 'fp_' + 32 caracteres hex)"
+        })
+
+    training_consent = bool(body.get("training_consent", False))
+
+    has_b64 = "audio_b64" in body
+    has_s3 = "s3_key" in body
+    if has_b64 and has_s3:
+        return _response(400, {
+            "error": "body no puede tener ambos 'audio_b64' y 's3_key'"
+        })
+    if not has_b64 and not has_s3:
+        return _response(400, {
+            "error": "body debe tener 'audio_b64' o 's3_key'"
+        })
+
+    # --- Fase 2: rate limit ------------------------------------------------
+    rate_ok, rate_info = _check_and_increment_rate_limit(fingerprint)
+    if not rate_ok:
+        return _predict_response(
+            429,
+            {"error": f"Llegaste al limite diario ({rate_info['limit']} audios). "
+                      "Volvé mañana para clasificar mas."},
+            rate_info=rate_info,
+        )
+
+    # --- Fase 3: generar identificadores -----------------------------------
+    prediction_id = str(uuid.uuid4())
+    timestamp_iso = datetime.now(timezone.utc).isoformat()
+
+    # --- Fase 4: adquirir + decodificar audio ------------------------------
+    # Retrocompat: audio_b64 sigue andando para clientes que no quieran el
+    # round-trip extra del presigned URL. La lectura/decode va DESPUES del
+    # rate limit — la cuota ya se consumio aca (anti-abuso intencional).
+    s3_key = body["s3_key"] if has_s3 else None
+    if has_b64:
         try:
             audio_bytes = base64.b64decode(body["audio_b64"], validate=True)
         except (ValueError, base64.binascii.Error) as e:
-            return _response(400, {"error": f"audio_b64 inválido: {e}"})
-    elif "s3_key" in body:
-        try:
-            audio_bytes = _read_audio_from_s3(body["s3_key"])
-        except ValueError as e:
-            # Key invalido (path traversal, prefix wrong, formato wrong) —
-            # NO tocamos S3, defense in depth.
-            return _response(400, {"error": str(e)})
-        except _S3_CLIENT.exceptions.NoSuchKey:
-            return _response(404, {"error": "s3_key no existe o expiró"})
-        except Exception as e:  # noqa: BLE001
-            return _response(500, {"error": f"S3 read falló: {type(e).__name__}: {e}"})
+            return _predict_response(
+                400, {"error": f"audio_b64 inválido: {e}"},
+                prediction_id=prediction_id, rate_info=rate_info,
+            )
     else:
-        return _response(400, {"error": "body debe tener 'audio_b64' o 's3_key'"})
+        try:
+            audio_bytes = _read_audio_from_s3(s3_key)
+        except ValueError as e:
+            # Key invalido (path traversal, prefix/formato wrong) — NO
+            # tocamos S3, defense in depth.
+            return _predict_response(
+                400, {"error": str(e)},
+                prediction_id=prediction_id, rate_info=rate_info,
+            )
+        except _S3_CLIENT.exceptions.NoSuchKey:
+            return _predict_response(
+                404, {"error": "s3_key no existe o expiró"},
+                prediction_id=prediction_id, rate_info=rate_info,
+            )
+        except Exception as e:  # noqa: BLE001
+            return _predict_response(
+                500, {"error": f"S3 read falló: {type(e).__name__}: {e}"},
+                prediction_id=prediction_id, rate_info=rate_info,
+            )
 
     try:
         y = _load_audio_bytes(audio_bytes)
-    except Exception as e:
-        return _response(400, {"error": f"no se pudo decodificar audio: {e}"})
+    except Exception as e:  # noqa: BLE001
+        return _predict_response(
+            400, {"error": f"no se pudo decodificar audio: {e}"},
+            prediction_id=prediction_id, rate_info=rate_info,
+        )
 
+    audio_size_bytes = len(audio_bytes)
+    audio_duration_s = len(y) / SAMPLE_RATE
     t0 = time.perf_counter()
 
+    # --- Fase 5: pre-filter sintetico (Capa 1) -----------------------------
     # Capa 1 (pre-BirdNET): rechazo de audio sintetico. Ahorra invoke a BirdNET.
     try:
         synthetic_reason = _classify_synthetic(y)
-    except Exception as e:
-        return _response(500, {"error": f"pre-filter falló: {type(e).__name__}: {e}"})
+    except Exception as e:  # noqa: BLE001
+        return _predict_response(
+            500, {"error": f"pre-filter falló: {type(e).__name__}: {e}"},
+            prediction_id=prediction_id, rate_info=rate_info,
+        )
     if synthetic_reason is not None:
         inference_ms = (time.perf_counter() - t0) * 1000.0
-        return _response(200, {
+        # Fase 8 (reject sintetico). El bool de _write_prediction_item se
+        # ignora a proposito: es fail-loud (ya logueo ERROR si fallo) y la
+        # response NO se rompe por un write de side-effect.
+        _write_prediction_item(
+            prediction_id=prediction_id, fingerprint=fingerprint,
+            timestamp_iso=timestamp_iso, result_status=synthetic_reason,
+            top_predictions=None, max_birdnet_confidence=None,
+            inference_time_ms=inference_ms, n_windows=None,
+            audio_duration_s=audio_duration_s, audio_size_bytes=audio_size_bytes,
+            s3_key=s3_key, training_consent=training_consent,
+        )
+        return _predict_response(200, {
             "detected": False,
             "reason": synthetic_reason,
             "model_version": MODEL_VERSION,
             "inference_time_ms": round(inference_ms, 2),
-        })
+        }, prediction_id=prediction_id, rate_info=rate_info)
 
-    # Capa 2 (BirdNET native gate) + Capa 3 (ONNX classifier).
+    # --- Fase 6 + 7: gate BirdNET (Capa 2) + clasificador ONNX (Capa 3) ----
+    # max_birdnet_confidence se persiste SIEMPRE (gated y happy path) para
+    # tener distribucion empirica y poder tunear el threshold con datos.
     try:
         embedding, max_conf_per_window, n_windows = _embed(y)
         max_birdnet_confidence, detected = _evaluate_detection(max_conf_per_window)
         predictions = _classify(embedding, top_k) if detected else None
-    except Exception as e:
-        return _response(500, {"error": f"inferencia falló: {type(e).__name__}: {e}"})
+    except Exception as e:  # noqa: BLE001
+        return _predict_response(
+            500, {"error": f"inferencia falló: {type(e).__name__}: {e}"},
+            prediction_id=prediction_id, rate_info=rate_info,
+        )
     inference_ms = (time.perf_counter() - t0) * 1000.0
 
-    # Fase 2 - Nivel 2: gating OOD. Si BirdNET nativo no detecto ave,
-    # devolvemos status 200 con detected=false en vez de predictions.
-    # max_birdnet_confidence se loguea SIEMPRE (gated y happy path) para
-    # tener distribucion empirica y poder tunear el threshold con datos.
+    # --- Fase 8 (reject not_a_bird): el gate BirdNET no detectó ave --------
     if not detected:
-        return _response(200, {
+        _write_prediction_item(
+            prediction_id=prediction_id, fingerprint=fingerprint,
+            timestamp_iso=timestamp_iso, result_status="not_a_bird",
+            top_predictions=None, max_birdnet_confidence=max_birdnet_confidence,
+            inference_time_ms=inference_ms, n_windows=n_windows,
+            audio_duration_s=audio_duration_s, audio_size_bytes=audio_size_bytes,
+            s3_key=s3_key, training_consent=training_consent,
+        )
+        return _predict_response(200, {
             "detected": False,
             "reason": "not_a_bird",
             "max_birdnet_confidence": round(max_birdnet_confidence, 4),
             "model_version": MODEL_VERSION,
             "n_windows": n_windows,
             "inference_time_ms": round(inference_ms, 2),
-        })
+        }, prediction_id=prediction_id, rate_info=rate_info)
 
-    return _response(200, {
+    # --- Fase 8 (detected): clasificación exitosa --------------------------
+    _write_prediction_item(
+        prediction_id=prediction_id, fingerprint=fingerprint,
+        timestamp_iso=timestamp_iso, result_status="detected",
+        top_predictions=predictions, max_birdnet_confidence=max_birdnet_confidence,
+        inference_time_ms=inference_ms, n_windows=n_windows,
+        audio_duration_s=audio_duration_s, audio_size_bytes=audio_size_bytes,
+        s3_key=s3_key, training_consent=training_consent,
+    )
+
+    # --- Fase 9: responder -------------------------------------------------
+    return _predict_response(200, {
         "predictions": predictions,
         "model_version": MODEL_VERSION,
         "n_windows": n_windows,
         "inference_time_ms": round(inference_ms, 2),
         "max_birdnet_confidence": round(max_birdnet_confidence, 4),
-    })
+    }, prediction_id=prediction_id, rate_info=rate_info)
 
 
 # ---------------------------------------------------------------------------
