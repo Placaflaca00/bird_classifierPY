@@ -22,6 +22,10 @@ sys.path.insert(0, str(_ROOT / "app"))
 
 import client as c  # noqa: E402
 
+# Datos compartidos para los tests de Fase 4.
+_FP = "fp_" + "a" * 32                              # fingerprint valido
+_PRED_ID = "12345678-1234-4234-8234-123456789abc"   # UUID4 canonico
+
 
 def _mock_response(status: int, json_body: dict | None = None) -> MagicMock:
     """Helper: crea un mock de requests.Response con status + json()."""
@@ -190,7 +194,9 @@ class TestPredictFullFlow:
         # Step 3 (PUT a S3): 200.
         mock_put.return_value = _mock_response(200)
 
-        result = c.predict(str(audio_file), top_k=3, api_url=self.URL)
+        result = c.predict(
+            str(audio_file), top_k=3, fingerprint=_FP, api_url=self.URL,
+        )
 
         assert result.ok is True
         assert result.detected is True
@@ -200,10 +206,11 @@ class TestPredictFullFlow:
         # 2 POSTs al session (upload-url + predict), 1 PUT a S3.
         assert mock_session.post.call_count == 2
         assert mock_put.call_count == 1
-        # Body del segundo POST tiene s3_key + top_k, NO audio_b64.
+        # Body del segundo POST: s3_key + top_k + fingerprint + training_consent.
         second_call = mock_session.post.call_args_list[1]
         assert second_call.kwargs["json"] == {
             "s3_key": "uploads/abc-uuid.mp3", "top_k": 3,
+            "fingerprint": _FP, "training_consent": False,
         }
 
     @patch.object(c, "_get_session")
@@ -218,7 +225,7 @@ class TestPredictFullFlow:
         mock_session.post.return_value = _mock_response(503)
         mock_session_factory.return_value = mock_session
 
-        result = c.predict(str(audio_file), api_url=self.URL)
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
 
         assert result.ok is False
         assert result.error_kind == "throttled"
@@ -246,7 +253,7 @@ class TestPredictFullFlow:
         # PUT a S3 falla con 403.
         mock_put.return_value = _mock_response(403)
 
-        result = c.predict(str(audio_file), api_url=self.URL)
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
 
         assert result.ok is False
         assert result.error_kind == "upload_failed"
@@ -275,10 +282,214 @@ class TestPredictFullFlow:
 
         mock_put.return_value = _mock_response(200)
 
-        result = c.predict(str(audio_file), api_url=self.URL)
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
 
         assert result.ok is False
         assert result.error_kind == "server"
         # Los 3 calls se hicieron (S3 OK, falla en el ultimo).
         assert mock_session.post.call_count == 2
         assert mock_put.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Fase 4 — RETRY_STATUS, rate limit, prediction_id/rate_info
+# ---------------------------------------------------------------------------
+class TestRetryConfig:
+    def test_session_no_reintenta_429(self) -> None:
+        """429 NO esta en status_forcelist (rate limit terminal); 503 si."""
+        assert c.RETRY_STATUS == (503,)
+        assert 429 not in c.RETRY_STATUS
+        # El Retry real del adapter refleja la config.
+        retry = c._build_session().get_adapter("https://x").max_retries
+        assert 429 not in retry.status_forcelist
+        assert 503 in retry.status_forcelist
+
+
+class TestPredictRateLimitAndIds:
+    URL = "https://api.test/prod/predict"
+
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_predict_429_rate_limited(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock, tmp_path: Path,
+    ) -> None:
+        """/predict 429 -> error_kind=rate_limited + rate_info, sin reintentos."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+        upload_resp = _mock_response(200, {
+            "upload_url": "https://s3.test/url", "s3_key": "uploads/x.mp3",
+            "content_type": "audio/mpeg",
+        })
+        rate_info = {"requests_today": 30, "limit": 30, "remaining": 0,
+                     "reset_at": "2026-05-21T00:00:00Z"}
+        predict_resp = _mock_response(429, {
+            "error": "Llegaste al limite diario (30 audios).",
+            "rate_info": rate_info,
+        })
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [upload_resp, predict_resp]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "rate_limited"
+        assert result.rate_info == rate_info
+        assert result.prediction_id is None
+        # 2 POSTs (upload-url + predict); el predict NO se reintento.
+        assert mock_session.post.call_count == 2
+
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_predict_extrae_prediction_id_y_rate_info(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock, tmp_path: Path,
+    ) -> None:
+        """200 detected -> prediction_id + rate_info en el PredictResult."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+        upload_resp = _mock_response(200, {
+            "upload_url": "https://s3.test/url", "s3_key": "uploads/x.mp3",
+            "content_type": "audio/mpeg",
+        })
+        predict_resp = _mock_response(200, {
+            "predictions": [{"species": "Rhea americana", "confidence": 0.9}],
+            "prediction_id": _PRED_ID,
+            "rate_info": {"requests_today": 3, "limit": 30, "remaining": 27},
+        })
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [upload_resp, predict_resp]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is True
+        assert result.prediction_id == _PRED_ID
+        assert result.rate_info["remaining"] == 27
+
+
+# ---------------------------------------------------------------------------
+# Fase 4c — _derive_feedback_url + send_feedback
+# ---------------------------------------------------------------------------
+class TestDeriveFeedbackUrl:
+    def test_predict_url_replaced(self) -> None:
+        url = "https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/predict"
+        assert c._derive_feedback_url(url) == (
+            "https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/feedback"
+        )
+
+    def test_fallback_when_no_predict_suffix(self) -> None:
+        assert c._derive_feedback_url("https://example.com/api") == (
+            "https://example.com/api/feedback"
+        )
+
+
+class TestSendFeedback:
+    URL = "https://api.test/prod/predict"
+
+    @patch.object(c, "_get_session")
+    def test_confirmed_ok(self, mock_session_factory: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(200, {
+            "prediction_id": _PRED_ID, "feedback_status": "confirmed",
+        })
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(_PRED_ID, _FP, "confirmed", api_url=self.URL)
+
+        assert result.ok is True
+        assert result.feedback_status == "confirmed"
+        call = mock_session.post.call_args
+        # URL es la DERIVADA (/feedback), no la /predict.
+        assert call.args[0] == "https://api.test/prod/feedback"
+        assert call.kwargs["json"] == {
+            "prediction_id": _PRED_ID, "fingerprint": _FP, "action": "confirmed",
+        }
+
+    @patch.object(c, "_get_session")
+    def test_corrected_incluye_corrected_species(
+        self, mock_session_factory: MagicMock,
+    ) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(
+            200, {"feedback_status": "corrected"})
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(
+            _PRED_ID, _FP, "corrected",
+            corrected_species="Rhea americana", api_url=self.URL,
+        )
+
+        assert result.ok is True
+        body = mock_session.post.call_args.kwargs["json"]
+        assert body["action"] == "corrected"
+        assert body["corrected_species"] == "Rhea americana"
+
+    @patch.object(c, "_get_session")
+    def test_rejected_as_non_bird_sin_species(
+        self, mock_session_factory: MagicMock,
+    ) -> None:
+        """action=rejected_as_non_bird -> body sin corrected_species."""
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(
+            200, {"feedback_status": "rejected_as_non_bird"})
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(
+            _PRED_ID, _FP, "rejected_as_non_bird", api_url=self.URL)
+
+        assert result.ok is True
+        assert "corrected_species" not in mock_session.post.call_args.kwargs["json"]
+
+    @patch.object(c, "_get_session")
+    def test_404_not_found(self, mock_session_factory: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(
+            404, {"error": "prediction_id no encontrado"})
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(_PRED_ID, _FP, "confirmed", api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "not_found"
+
+    @patch.object(c, "_get_session")
+    def test_409_already_submitted_con_current_status(
+        self, mock_session_factory: MagicMock,
+    ) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(409, {
+            "error": "esta predicción ya tiene feedback registrado",
+            "current_status": "confirmed",
+        })
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(_PRED_ID, _FP, "confirmed", api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "already_submitted"
+        assert result.current_status == "confirmed"
+
+    @patch.object(c, "_get_session")
+    def test_400_bad_request(self, mock_session_factory: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(
+            400, {"error": "action inválido"})
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(_PRED_ID, _FP, "garbage", api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "bad_request"
+
+    @patch.object(c, "_get_session")
+    def test_503_throttled(self, mock_session_factory: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session.post.return_value = _mock_response(503, {})
+        mock_session_factory.return_value = mock_session
+
+        result = c.send_feedback(_PRED_ID, _FP, "confirmed", api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "throttled"

@@ -1,9 +1,13 @@
-"""Cliente HTTP del flow de prediccion (Fase 3 — S3 presigned URLs).
+"""Cliente HTTP del flow de prediccion + feedback (Fase 3 S3 + Fase 4).
 
 Flujo de ``predict(audio)`` por llamada (3 requests):
     1. POST ``/upload-url`` -> presigned PUT URL + s3_key
     2. PUT audio directo a S3 (no pasa por API GW)
-    3. POST ``/predict`` con ``{s3_key, top_k}`` -> PredictResult
+    3. POST ``/predict`` con ``{s3_key, top_k, fingerprint, training_consent}``
+       -> PredictResult
+
+``send_feedback()`` (Fase 4c) hace POST a ``/feedback`` para registrar la
+correccion del usuario sobre una prediccion previa.
 
 El backend Lambda mantiene retrocompat con ``audio_b64`` (clientes externos /
 mobile native podrian usarla), pero este cliente solo usa el flow S3. Razon:
@@ -31,6 +35,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -87,12 +92,15 @@ REQUEST_TIMEOUT: tuple[float, float] = (5.0, 35.0)
 UPLOAD_URL_TIMEOUT: tuple[float, float] = (5.0, 15.0)
 S3_PUT_TIMEOUT: tuple[float, float] = (5.0, 30.0)
 
-# Reintentos: backoff 1.5s / 3s / 6s. status_forcelist incluye 429 y 503 porque
-# Fase 1 verificó que el throttling del HTTP API devuelve 503 (no el 429 que
-# documenta AWS).
+# Reintentos: backoff 1.5s / 3s / 6s.
 MAX_RETRIES = 3
 BACKOFF_FACTOR = 1.5
-RETRY_STATUS = (429, 503)
+# 429 NO se reintenta: el rate limit del backend es terminal (cuota
+# diaria), no transitorio. Reintentar gasta tiempo en algo que no va a
+# cambiar hasta reset_at del próximo día UTC. 503 sí se reintenta:
+# API Gateway throttling es transitorio (Fase 1 verificó que el HTTP API
+# devuelve 503, no el 429 que documenta AWS).
+RETRY_STATUS = (503,)
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +149,36 @@ class PredictResult:
     detected: bool = True
     reject_reason: str | None = None
     max_birdnet_confidence: float | None = None
-    # "throttled" | "timeout" | "server" | "bad_request"
+    # Fase 4: prediction_id identifica la prediccion para /feedback;
+    # rate_info ({requests_today, limit, remaining, [reset_at]}) deja a la UI
+    # mostrar la cuota. Presentes en todo 200 de /predict; rate_info ademas
+    # en el 429 (donde prediction_id es None — no hubo prediccion).
+    prediction_id: str | None = None
+    rate_info: dict[str, Any] | None = None
+    # "throttled" | "timeout" | "server" | "bad_request" | "rate_limited"
     #   | "network" | "bad_response" | "config" | "upload_failed"
+    error_kind: str | None = None
+    error_message: str | None = None
+
+
+@dataclass
+class FeedbackResult:
+    """Resultado de ``send_feedback()`` -> POST /feedback.
+
+    Mismo patron que PredictResult: si ``ok`` es False, ``error_kind`` /
+    ``error_message`` explican que paso. ``send_feedback()`` nunca lanza por
+    errores de red o HTTP.
+
+    ``current_status`` solo se puebla en el 409 (la prediccion ya tenia
+    feedback): es el ``feedback_status`` previo, para que la UI de un mensaje
+    especifico ("ya marcaste esto como X") en vez de uno generico.
+    """
+
+    ok: bool
+    feedback_status: str | None = None
+    current_status: str | None = None
+    # "bad_request" | "not_found" | "already_submitted" | "server"
+    #   | "throttled" | "timeout" | "network" | "bad_response" | "config"
     error_kind: str | None = None
     error_message: str | None = None
 
@@ -153,17 +189,18 @@ class PredictResult:
 def _build_session() -> requests.Session:
     """``requests.Session`` con reintentos automáticos vía urllib3.
 
-    - ``status_forcelist=[429, 503]``: reintenta el throttling del HTTP API, que
-      devuelve 503 (verificado en Fase 1), no el 429 que documenta AWS.
+    - ``status_forcelist=[503]``: reintenta solo el throttling del HTTP API
+      (Fase 1 verificó que devuelve 503). El 429 NO se reintenta — el rate
+      limit del backend (Fase 4) es terminal, no transitorio.
     - ``read=False``: NO reintenta read-timeouts. Si ya esperamos 35 s, reintentar
       otros 35 s es peor que fallar rápido; se re-lanza como ReadTimeout.
     - ``connect`` (hereda de ``total``): SÍ reintenta errores de conexión
       transitorios (red que parpadea, DNS).
     - ``allowed_methods=["POST"]``: por defecto urllib3 no reintenta POST. Acá es
-      seguro porque /predict NO muta estado (solo devuelve una predicción), así
-      que un POST repetido es efectivamente idempotente. OJO: el futuro endpoint
-      /flag (Fase 4) escribe en DynamoDB — eso SÍ muta estado y va a necesitar
-      idempotency keys de verdad; no copiar este patrón allá.
+      seguro: /predict no muta estado, y /feedback (Fase 4c) es idempotente
+      server-side vía el ConditionExpression del UpdateItem. Además solo se
+      reintenta 503, que viene de API Gateway ANTES de invocar el Lambda — el
+      UpdateItem nunca llegó a correr, así que el retry es la primera ejecución.
     - ``respect_retry_after_header=True``: si la API manda Retry-After algún día,
       lo respetamos gratis.
     """
@@ -213,6 +250,18 @@ def _derive_upload_url_url(predict_url: str) -> str:
     if predict_url.endswith("/predict"):
         return predict_url[: -len("/predict")] + "/upload-url"
     return predict_url.rstrip("/") + "/upload-url"
+
+
+def _derive_feedback_url(predict_url: str) -> str:
+    """Deriva la URL de /feedback a partir de la de /predict.
+
+    Misma convencion que ``_derive_upload_url_url``: ambos endpoints viven en
+    el mismo stage del mismo API. Si predict_url termina en '/predict',
+    reemplaza ese segmento; si no, append '/feedback' al base.
+    """
+    if predict_url.endswith("/predict"):
+        return predict_url[: -len("/predict")] + "/feedback"
+    return predict_url.rstrip("/") + "/feedback"
 
 
 def _get_upload_url(ext: str, api_url: str | None = None) -> UploadUrlResult:
@@ -382,6 +431,8 @@ def _map_response(resp: requests.Response) -> PredictResult:
                 model_version=data.get("model_version"),
                 n_windows=data.get("n_windows"),
                 inference_time_ms=data.get("inference_time_ms"),
+                prediction_id=data.get("prediction_id"),
+                rate_info=data.get("rate_info"),
             )
 
         # Happy path: predicciones presentes. Cubre handler nuevo
@@ -400,6 +451,8 @@ def _map_response(resp: requests.Response) -> PredictResult:
             n_windows=data.get("n_windows"),
             inference_time_ms=data.get("inference_time_ms"),
             max_birdnet_confidence=data.get("max_birdnet_confidence"),
+            prediction_id=data.get("prediction_id"),
+            rate_info=data.get("rate_info"),
         )
 
     detail = _extract_error_detail(resp)
@@ -421,7 +474,24 @@ def _map_response(resp: requests.Response) -> PredictResult:
             ok=False, error_kind="timeout",
             error_message="el servidor tardó demasiado (audio largo o cold start)",
         )
-    # 429/503 normalmente los reintenta la Session y, si se agotan, llegan como
+    # 429 = rate limit del backend (Fase 4): cuota diaria agotada. Terminal —
+    # la Session NO lo reintenta (429 no está en RETRY_STATUS). El body trae
+    # rate_info con reset_at; lo propagamos para que la UI diga cuándo vuelve.
+    if status == 429:
+        rl_body: dict = {}
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                rl_body = parsed
+        except ValueError:
+            pass
+        return PredictResult(
+            ok=False, error_kind="rate_limited",
+            rate_info=rl_body.get("rate_info"),
+            error_message=rl_body.get("error")
+            or "alcanzaste el límite diario de clasificaciones",
+        )
+    # 503 lo reintenta la Session; si se agotan los retries llega como
     # RetryError (no acá). Este branch es defensivo por si raise_on_status cambia.
     if status in RETRY_STATUS:
         return PredictResult(
@@ -445,16 +515,26 @@ def _map_response(resp: requests.Response) -> PredictResult:
 def predict(
     audio: str | Path | bytes,
     top_k: int = DEFAULT_TOP_K,
+    *,
+    fingerprint: str,
+    training_consent: bool = False,
     api_url: str | None = None,
 ) -> PredictResult:
-    """Sube ``audio`` a S3 y dispara la prediccion. Devuelve PredictResult.
+    """Sube ``audio`` a S3 y dispara la prediccion. /predict consume cuota
+    del usuario (rate limited).
+
+    ``fingerprint`` es keyword-only y requerido para hacer EXPLICITO que cada
+    llamada consume cuota del usuario. Auto-generacion interna ocultaria esta
+    dependency, llevando a CLI loops sin rate limit y a callers confundidos
+    sobre por que prod hits 429.
 
     Flow (3 requests):
         1. POST /upload-url -> presigned URL + s3_key
         2. PUT audio a S3 (directo, no por API GW)
-        3. POST /predict {s3_key, top_k}
+        3. POST /predict {s3_key, top_k, fingerprint, training_consent}
 
-    Nunca lanza por errores de red/HTTP: todo se mapea a ``error_kind``.
+    Nunca lanza por errores de red/HTTP: todo se mapea a ``error_kind``
+    (incluido ``rate_limited`` cuando el backend devuelve 429).
     ``audio`` puede ser path (str/Path) o bytes crudos del archivo.
 
     ``ext`` para el presigned se infiere del path. Si ``audio`` es bytes
@@ -509,7 +589,12 @@ def predict(
         )
 
     # --- Step 4: POST /predict con s3_key ------------------------------
-    body = {"s3_key": upload.s3_key, "top_k": int(top_k)}
+    body = {
+        "s3_key": upload.s3_key,
+        "top_k": int(top_k),
+        "fingerprint": fingerprint,
+        "training_consent": bool(training_consent),
+    }
 
     try:
         resp = _get_session().post(url, json=body, timeout=REQUEST_TIMEOUT)
@@ -538,6 +623,143 @@ def predict(
 
 
 # ---------------------------------------------------------------------------
+# Feedback (Fase 4c)
+# ---------------------------------------------------------------------------
+def _map_feedback_response(resp: requests.Response) -> FeedbackResult:
+    """Mapea una respuesta HTTP de /feedback a FeedbackResult."""
+    status = resp.status_code
+
+    if status == 200:
+        try:
+            data = resp.json()
+        except ValueError:
+            return FeedbackResult(
+                ok=False, error_kind="bad_response",
+                error_message="la respuesta de /feedback no es JSON válido",
+            )
+        return FeedbackResult(
+            ok=True,
+            feedback_status=data.get("feedback_status")
+            if isinstance(data, dict) else None,
+        )
+
+    detail = _extract_error_detail(resp)
+
+    if status == 400:
+        return FeedbackResult(
+            ok=False, error_kind="bad_request",
+            error_message=detail or "el servidor rechazó el feedback",
+        )
+    if status == 404:
+        return FeedbackResult(
+            ok=False, error_kind="not_found",
+            error_message=detail or "la predicción no existe o expiró",
+        )
+    if status == 409:
+        # El feedback ya estaba registrado. El handler (4c) devuelve
+        # current_status: el feedback_status que ya tenía la predicción.
+        current = None
+        try:
+            body = resp.json()
+            if isinstance(body, dict):
+                current = body.get("current_status")
+        except ValueError:
+            pass
+        return FeedbackResult(
+            ok=False, error_kind="already_submitted", current_status=current,
+            error_message=detail or "esta predicción ya tiene feedback registrado",
+        )
+    # 503 lo reintenta la Session; defensivo por si raise_on_status cambia.
+    if status in RETRY_STATUS:
+        return FeedbackResult(
+            ok=False, error_kind="throttled",
+            error_message="el servicio está saturado, probá de nuevo en unos segundos",
+        )
+    if 500 <= status < 600:
+        return FeedbackResult(
+            ok=False, error_kind="server",
+            error_message=detail or f"error interno del servidor (HTTP {status})",
+        )
+    return FeedbackResult(
+        ok=False, error_kind="bad_request",
+        error_message=detail or f"respuesta inesperada del servidor (HTTP {status})",
+    )
+
+
+def send_feedback(
+    prediction_id: str,
+    fingerprint: str,
+    action: str,
+    corrected_species: str | None = None,
+    api_url: str | None = None,
+) -> FeedbackResult:
+    """POST /feedback — registra el feedback del usuario sobre una prediccion.
+
+    Idempotency-safe a retries de 503. /feedback usa ``_get_session()`` (que
+    reintenta 503) con seguridad porque:
+
+    1. El 503 viene de API Gateway, ANTES de invocar el Lambda.
+    2. Si hay 503, el UpdateItem NUNCA corrio en DynamoDB.
+    3. El retry llega al Lambda y ejecuta el UpdateItem por primera vez.
+
+    Si el Lambda DEVOLVIERA 503 (improbable, seria un bug interno), el
+    ConditionExpression del UpdateItem garantiza idempotency a nivel
+    DynamoDB: un segundo retry recibiria 409.
+
+    AWS Builders Library: "idempotent operations are safe to retry,
+    allowing client code to simplify error handling."
+
+    Args:
+        prediction_id: el UUID4 que devolvio /predict en ``PredictResult``.
+        fingerprint: mismo fingerprint del usuario (``fp_<32hex>``).
+        action: "confirmed" | "corrected" | "rejected_as_non_bird".
+        corrected_species: nombre cientifico, SOLO si action == "corrected".
+
+    Nunca lanza — el caller chequea ``FeedbackResult.ok``.
+    """
+    base = _resolve_api_url(api_url)
+    if not base:
+        return FeedbackResult(
+            ok=False, error_kind="config",
+            error_message=f"falta la variable de entorno {API_URL_ENV}",
+        )
+    url = _derive_feedback_url(base)
+
+    body: dict[str, Any] = {
+        "prediction_id": prediction_id,
+        "fingerprint": fingerprint,
+        "action": action,
+    }
+    if corrected_species is not None:
+        body["corrected_species"] = corrected_species
+
+    try:
+        resp = _get_session().post(url, json=body, timeout=REQUEST_TIMEOUT)
+    except requests.exceptions.RetryError:
+        return FeedbackResult(
+            ok=False, error_kind="throttled",
+            error_message="el servicio está saturado, probá de nuevo en unos segundos",
+        )
+    except requests.exceptions.ConnectionError:
+        return FeedbackResult(
+            ok=False, error_kind="network",
+            error_message="no se pudo conectar con el servidor",
+        )
+    except requests.exceptions.Timeout:
+        return FeedbackResult(
+            ok=False, error_kind="timeout",
+            error_message="el servidor tardó demasiado en responder",
+        )
+    except requests.exceptions.RequestException as e:
+        return FeedbackResult(
+            ok=False, error_kind="network",
+            error_message=f"error de red: {e}",
+        )
+
+    return _map_feedback_response(resp)
+
+
+# ---------------------------------------------------------------------------
 # Test local (CLI)
 # ---------------------------------------------------------------------------
 def _local_main() -> int:
@@ -556,7 +778,13 @@ def _local_main() -> int:
         print(f"audio no existe: {args.audio}", file=sys.stderr)
         return 2
 
-    result = predict(args.audio, top_k=args.top_k, api_url=args.api_url)
+    # /predict exige fingerprint; el CLI genera uno efimero por invocacion
+    # (no necesita persistencia cross-run como el frontend con BrowserState).
+    fingerprint = f"fp_{uuid.uuid4().hex}"
+    result = predict(
+        args.audio, top_k=args.top_k,
+        fingerprint=fingerprint, api_url=args.api_url,
+    )
 
     if not result.ok:
         print(
