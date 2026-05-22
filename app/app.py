@@ -26,7 +26,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from client import predict
+from client import predict, send_feedback
 from fingerprint import get_or_create_fingerprint
 from validation import validate_audio
 
@@ -313,6 +313,25 @@ def _format_quota_indicator(rate_info: dict | None):
     return gr.update(visible=True, value=f"⚠️ {texto}")
 
 
+# Fase 4d.3 — 5-tupla de feedback para el return de classify(). Resetea el
+# estado del feedback en cada clasificacion (correction group + status
+# ocultos), decide si mostrar los botones 👍/👎 (solo en deteccion exitosa),
+# y actualiza el grid de correccion (HTML sin la especie ya predicha).
+def _feedback_reset(prediction_id: str | None, show_buttons: bool,
+                    grid_update) -> tuple:
+    """Outputs (prediction_id_state, feedback_buttons_group,
+    feedback_correction_group, feedback_status, feedback_grid) para el return
+    de classify(). ``grid_update`` = HTML str del grid, o gr.update() no-op.
+    """
+    return (
+        prediction_id,
+        gr.update(visible=show_buttons),
+        gr.update(visible=False),
+        gr.update(value=""),  # feedback_status: always-mounted, solo se limpia
+        grid_update,
+    )
+
+
 def classify(audio_path: str | None, fingerprint: str | None, training_consent: bool):
     """Callback del boton Clasificar.
 
@@ -322,12 +341,18 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
         2. training_consent  -> bool del consent_checkbox
 
     Outputs (orden importa, matchea el .click() abajo):
-        0. result_group   -> visible True/False
-        1. error_box      -> visible + value (texto del error o vacio)
-        2. bird_photo     -> Image, path o None
-        3. bird_info      -> Markdown con ficha
-        4. label_out      -> dict {label: prob} para gr.Label
-        5. quota_indicator -> gr.update (escalating visibility de la cuota)
+        0. result_group              -> visible True/False
+        1. error_box                 -> visible + value (texto del error)
+        2. bird_photo                -> Image, path o None
+        3. bird_info                 -> Markdown con ficha
+        4. label_out                 -> dict {label: prob} para gr.Label
+        5. quota_indicator           -> gr.update (escalating visibility)
+        6. prediction_id_state       -> str (prediction_id) o None
+        7. feedback_buttons_group    -> visible (True solo en deteccion ok)
+        8. feedback_correction_group -> visible False (reset)
+        9. feedback_status           -> visible False, value "" (reset)
+       10. feedback_grid             -> HTML del grid sin la especie predicha
+    Los outputs 6-10 los arma _feedback_reset() (Fase 4d.3).
 
     Asimetria posicional/keyword: Gradio pasa los inputs POSICIONALES; se
     reenvian a ``predict()`` como KEYWORD-ONLY (``fingerprint=...``,
@@ -364,6 +389,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value=validation.error_message),
             hidden[1], hidden[2], hidden[3],
             _format_quota_indicator(None),
+            *_feedback_reset(None, False, gr.update()),
         )
 
     result = predict(
@@ -393,6 +419,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
             quota,
+            *_feedback_reset(None, False, gr.update()),
         )
 
     # Fase 2 - Nivel 2: backend rechazo el audio por gating. Mensaje
@@ -407,6 +434,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
             quota,
+            *_feedback_reset(None, False, gr.update()),
         )
 
     if not result.predictions:
@@ -416,6 +444,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value="El servidor no devolvio predicciones."),
             hidden[1], hidden[2], hidden[3],
             quota,
+            *_feedback_reset(None, False, gr.update()),
         )
 
     top1 = result.predictions[0]
@@ -434,7 +463,129 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
         info_md,                                  # bird_info
         labels,                                   # label_out
         quota,                                    # quota_indicator
+        *_feedback_reset(
+            result.prediction_id, True,
+            _render_feedback_grid(exclude=species),
+        ),  # feedback (4d.3): grid sin la especie predicha
     )
+
+
+# ---------------------------------------------------------------------------
+# Fase 4d.3 — UI de feedback (👍/👎 + correccion por galeria)
+# ---------------------------------------------------------------------------
+# error_kind de client.FeedbackResult -> mensaje user-facing. Sin entrada para
+# un kind => fallback generico. Mismo patron que _ERROR_MESSAGES.
+_FEEDBACK_ERRORS = {
+    "already_submitted": "Ya diste feedback para esta predicción.",
+    "not_found": (
+        "No se encontró esa predicción. Probá clasificando un nuevo audio."
+    ),
+}
+_FEEDBACK_OK = "¡Gracias! Tu feedback nos ayuda a mejorar las predicciones."
+_FEEDBACK_FALLBACK = "No se pudo registrar tu feedback. Probá de nuevo en un rato."
+
+
+# Orden canonico de las 20 aves con foto. Lo usan _render_feedback_grid (el
+# grid visual) y el wiring de los botones-puente — MISMO orden, asi la card #N
+# del grid clickea el boton fb-pick-N, que tiene la especie #N fijada.
+_FEEDBACK_SPECIES = [s for s in sorted(_SPECIES_INFO) if _resolve_bird_photo(s)]
+
+
+def _render_feedback_grid(exclude: str | None = None) -> str:
+    """Grid HTML clickeable de las aves — reemplaza gr.Gallery (B1).
+
+    Si ``exclude`` es un nombre cientifico, esa card se omite (4d.3): cuando el
+    modelo predijo una especie y el usuario marca 👎, esa especie NO se ofrece
+    como correccion — es ilogico (👎 = "no es eso") y bloquea feedback
+    troll/contradictorio (corrected_species == lo que el modelo predijo).
+    Quedan 19 cards.
+
+    gr.Gallery colgaba el evento que lo abre en este app (ver memoria
+    gradio-dynamic-visibility); gr.HTML SI funciona (Tab 2 lo prueba). El
+    onclick de cada card clickea un gr.Button oculto (fb-pick-<i>): el .click()
+    de un gr.Button es 100% confiable. Cada boton tiene su especie fijada por
+    closure => la especie viaja directo. Las cards NO excluidas mantienen su
+    indice original `i` (el del excluido simplemente no se renderiza).
+    """
+    cards: list[str] = []
+    for i, species in enumerate(_FEEDBACK_SPECIES):
+        if species == exclude:
+            continue
+        info = _SPECIES_INFO[species]
+        common = html_mod.escape(info.get("es") or species)
+        url = "/gradio_api/file=" + str(_resolve_bird_photo(species)).replace(
+            "\\", "/")
+        onclick = "document.getElementById('fb-pick-" + str(i) + "').click()"
+        cards.append(
+            '<div class="fb-bird-card" data-species="'
+            + html_mod.escape(species) + '" title="' + common + '" onclick="'
+            + onclick + '">'
+            '<div class="fb-bird-img"><img src="' + url + '" loading="lazy" '
+            'decoding="async" alt="' + common + '"></div>'
+            '<div class="fb-bird-name">' + common + '</div></div>'
+        )
+    return '<div class="fb-bird-grid">' + "".join(cards) + "</div>"
+
+
+def _feedback_status_update(result):
+    """gr.update para feedback_status segun el FeedbackResult de send_feedback."""
+    if result.ok:
+        msg = _FEEDBACK_OK
+    else:
+        msg = _FEEDBACK_ERRORS.get(result.error_kind, _FEEDBACK_FALLBACK)
+    return gr.update(value=msg)  # feedback_status always-mounted: solo value
+
+
+def _on_thumbs_up(prediction_id: str | None, fingerprint: str | None) -> tuple:
+    """👍 Acertó -> feedback 'confirmed'. Oculta los botones, muestra el status.
+
+    Outputs: (feedback_buttons_group, feedback_status)
+    """
+    result = send_feedback(prediction_id or "", fingerprint or "", "confirmed")
+    return gr.update(visible=False), _feedback_status_update(result)
+
+
+def _on_thumbs_down() -> tuple:
+    """👎 Falló -> oculta los botones, abre el grupo de correccion (grid HTML).
+
+    Outputs: (feedback_buttons_group, feedback_correction_group)
+    """
+    return gr.update(visible=False), gr.update(visible=True)
+
+
+def _on_pick_species(
+    species: str, prediction_id: str | None, fingerprint: str | None
+) -> tuple:
+    """Click en una card del grid -> feedback 'corrected' (B1).
+
+    ``species`` (nombre cientifico) viene fijado por closure en el wiring del
+    boton-puente fb-pick-<i> que la card clickeo — viaja directo, sin indice.
+    Outputs: (feedback_correction_group, feedback_status)
+    """
+    result = send_feedback(
+        prediction_id or "", fingerprint or "", "corrected",
+        corrected_species=species,
+    )
+    return gr.update(visible=False), _feedback_status_update(result)
+
+
+def _on_non_bird(prediction_id: str | None, fingerprint: str | None) -> tuple:
+    """'Esto no era un pájaro' -> feedback 'rejected_as_non_bird'.
+
+    Outputs: (feedback_correction_group, feedback_status)
+    """
+    result = send_feedback(
+        prediction_id or "", fingerprint or "", "rejected_as_non_bird"
+    )
+    return gr.update(visible=False), _feedback_status_update(result)
+
+
+def _on_cancel() -> tuple:
+    """'Volver' -> cierra la correccion, vuelve a mostrar 👍/👎.
+
+    Outputs: (feedback_buttons_group, feedback_correction_group)
+    """
+    return gr.update(visible=True), gr.update(visible=False)
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +771,46 @@ _CSS = (
     opacity: 0.75;
     line-height: 1.35;
 }
+.fb-hidden {
+    display: none !important;
+}
+.fb-bird-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 10px;
+    margin-top: 8px;
+    max-height: 420px;
+    overflow-y: auto;
+}
+.fb-bird-card {
+    background: {{BG_CARD}};
+    border-radius: 8px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 2px solid transparent;
+    transition: border-color 0.15s;
+}
+.fb-bird-card:hover {
+    border-color: {{SECONDARY}};
+}
+.fb-bird-img {
+    width: 100%;
+    height: 110px;
+    overflow: hidden;
+    background: rgba(0,0,0,0.15);
+}
+.fb-bird-img img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+.fb-bird-name {
+    padding: 5px 7px;
+    font-size: 0.8em;
+    color: {{SECONDARY}};
+    text-align: center;
+}
 .bird-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -764,6 +955,62 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                     num_top_classes=TOP_K, label="Top 3 predicciones"
                 )
 
+            # ---- Fase 4d.3: UI de feedback ----
+            # prediction_id de la ultima clasificacion; lo setea classify().
+            # gr.State (no BrowserState): estado de sesion, no persiste.
+            prediction_id_state = gr.State(None)
+
+            # Botones 👍/👎 — visibles solo tras una deteccion exitosa.
+            with gr.Row(visible=False) as feedback_buttons_group:
+                feedback_thumbs_up = gr.Button(
+                    "👍 Acertó", variant="primary",
+                    elem_id="feedback-thumbs-up",
+                )
+                feedback_thumbs_down = gr.Button(
+                    "👎 Falló", variant="secondary",
+                    elem_id="feedback-thumbs-down",
+                )
+
+            # Correccion — grid HTML clickeable de las 20 especies; se abre
+            # con 👎. B1: gr.HTML, NO gr.Gallery — gr.Gallery cuelga el evento
+            # en este app (ver memoria gradio-dynamic-visibility). El click de
+            # una card escribe en feedback_pick (Textbox-puente) via JS inline
+            # y eso dispara _on_pick_species.
+            with gr.Group(visible=False) as feedback_correction_group:
+                gr.Markdown("¿Cuál era el pájaro? Tocá la foto correcta.")
+                feedback_grid = gr.HTML(_render_feedback_grid())
+                gr.Markdown(
+                    "Fotos: colaboradores de iNaturalist y Wikimedia Commons "
+                    "— créditos completos en «Las 20 aves».",
+                    elem_classes="photo-credit",
+                )
+                with gr.Row():
+                    feedback_non_bird_btn = gr.Button(
+                        "Esto no era un pájaro", variant="secondary",
+                        elem_id="feedback-non-bird-btn",
+                    )
+                    feedback_cancel_btn = gr.Button(
+                        "Volver", variant="secondary",
+                        elem_id="feedback-cancel-btn",
+                    )
+
+            # Mensaje post-feedback ("¡Gracias!" o error). SIEMPRE montado
+            # (value="" cuando no hay nada que decir): Gradio 6.14 no monta un
+            # gr.Markdown visible=False mostrado por un handler de feedback
+            # (verificado server-side — el handler devuelve un gr.update
+            # valido pero el componente no aparece). Always-mounted lo evita;
+            # los handlers solo cambian su `value`, nunca su `visible`.
+            feedback_status = gr.Markdown(value="", elem_id="feedback-status")
+
+            # Botones-puente ocultos (B1): el onclick de cada card del grid
+            # clickea su boton fb-pick-<i>. gr.Button.click es 100% confiable.
+            # Siempre montados (visible=True, ocultos por CSS .fb-hidden) — un
+            # visible=False no estaria en el DOM (Gradio 6.14).
+            fb_pick_btns = [
+                gr.Button("", elem_id=f"fb-pick-{i}", elem_classes="fb-hidden")
+                for i in range(len(_FEEDBACK_SPECIES))
+            ]
+
             # Fase 4d.2d — indicador de cuota (escalating visibility). Oculto
             # por default; classify() lo actualiza via _format_quota_indicator.
             quota_indicator = gr.Markdown(
@@ -804,11 +1051,43 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                 outputs=[
                     result_group, error_box, bird_photo, bird_info,
                     label_out, quota_indicator,
+                    prediction_id_state, feedback_buttons_group,
+                    feedback_correction_group, feedback_status, feedback_grid,
                 ],
             ).then(
                 fn=_on_audio_change,
                 inputs=audio_in,
                 outputs=[submit, status_hint],
+            )
+
+            # ---- Feedback wiring (Fase 4d.3) --------------------------------
+            feedback_thumbs_up.click(
+                fn=_on_thumbs_up,
+                inputs=[prediction_id_state, fingerprint_state],
+                outputs=[feedback_buttons_group, feedback_status],
+            )
+            feedback_thumbs_down.click(
+                fn=_on_thumbs_down,
+                inputs=None,
+                outputs=[feedback_buttons_group, feedback_correction_group],
+            )
+            # Cada boton-puente -> _on_pick_species con su especie fijada por
+            # closure (sp=_pick_sp captura el valor en el momento del loop).
+            for _pick_btn, _pick_sp in zip(fb_pick_btns, _FEEDBACK_SPECIES):
+                _pick_btn.click(
+                    fn=lambda pid, fp, sp=_pick_sp: _on_pick_species(sp, pid, fp),
+                    inputs=[prediction_id_state, fingerprint_state],
+                    outputs=[feedback_correction_group, feedback_status],
+                )
+            feedback_non_bird_btn.click(
+                fn=_on_non_bird,
+                inputs=[prediction_id_state, fingerprint_state],
+                outputs=[feedback_correction_group, feedback_status],
+            )
+            feedback_cancel_btn.click(
+                fn=_on_cancel,
+                inputs=None,
+                outputs=[feedback_buttons_group, feedback_correction_group],
             )
 
         # ----- Tab 2: Las 20 aves -----
