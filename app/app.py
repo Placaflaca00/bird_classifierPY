@@ -27,6 +27,7 @@ from pathlib import Path
 import gradio as gr
 
 from client import predict
+from fingerprint import get_or_create_fingerprint
 from validation import validate_audio
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,29 @@ HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
 SPECIES_INFO_PATH = HERE / "species_info.json"
+
+# Fase 4d — fingerprint anónimo por dispositivo para el rate limit del backend.
+# gr.BrowserState lo persiste en localStorage; el secret debe ser FIJO o el
+# valor no sobrevive un restart del Space (con secret=None Gradio genera uno
+# random por arranque → localStorage indescifrable post-restart). Hardcodear es
+# seguro acá: encripta un UUID anónimo (no info sensible), HF Spaces aísla cada
+# Space en subdominio único (cross-origin previene leakage entre apps), y el
+# sufijo -v1 es palanca de reset deliberado. Verificado en 4d.0 (smoke real).
+BROWSER_STATE_SECRET = "bird-classifier-fp-v1"
+
+# Fase 4d — consentimiento opt-in. Default DESMARCADO; el "(Opcional)"
+# explícito evita que el usuario dude si marcar es requisito (GDPR UX
+# best practice — ver Econsultancy "GDPR best practice UX for obtaining
+# marketing consent"). GDPR "freely given": el checkbox NO condiciona la
+# clasificación — el botón Clasificar funciona marcado o no, y el checkbox
+# no se wirea a ningún evento. Su valor se leerá como input de classify()
+# recién en 4d.2c. Disclosure inline simple; la versión layered (label
+# corto + accordion) se difiere a 4e.
+CONSENT_LABEL = (
+    "(Opcional) Permito usar este audio para mejorar el modelo, lo que puede "
+    "incluir revisión manual por colaboradores del proyecto. Audio licenciado "
+    "bajo Creative Commons BY 4.0."
+)
 
 # Paleta "bosque calido" — verde oliva, sensacion organica.
 BG_DEEP = "#2f3a28"      # fondo de la pagina
@@ -77,6 +101,14 @@ _ERROR_MESSAGES = {
     "upload_failed": (
         "No se pudo subir el audio al servidor. Revisa tu conexion y proba "
         "de nuevo (puede ser un audio muy grande, o conexion inestable)."
+    ),
+    # Fase 4 — 429 del backend: cuota diaria agotada. Distinto de "throttled"
+    # (503, throttle transitorio del API Gateway): "rate_limited" es terminal,
+    # no se reintenta. El conteo "(30 audios)" es literal — la version dinamica
+    # (leer rate_info["limit"]) es future work (ver phase4d-plan, seccion 4e).
+    "rate_limited": (
+        "Llegaste al límite diario (30 audios). Volvé mañana para "
+        "clasificar más."
     ),
 }
 
@@ -246,8 +278,48 @@ def _hidden_result() -> tuple:
     )
 
 
-def classify(audio_path: str | None):
+# Fase 4d.2d — quota indicator (escalating visibility). Thresholds 10/5/1:
+# >=10 oculto (uso normal; ~33% es el corte generico de Moesif), 5-9 heads-up
+# suave, 1-4 alerta con emoji. A 0 (y negativo) oculto: el mensaje 429 ya
+# cubre el limite alcanzado, y "Te quedan 0" sonaria a advertencia cuando la
+# realidad es "ya no hay".
+def _format_quota_indicator(rate_info: dict | None):
+    """gr.update para quota_indicator segun escalating visibility.
+
+    ``rate_info`` (de ``PredictResult``) trae ``remaining``. Oculto si no hay
+    info utilizable — no mostrar un valor posiblemente stale es mejor que
+    mentir.
+    """
+    if not rate_info or "remaining" not in rate_info:
+        return gr.update(visible=False, value="")
+
+    remaining = rate_info["remaining"]
+
+    # Oculto en uso normal (>=10) y tambien en 0/negativo: a 0 el mensaje 429
+    # ya cubre; un remaining negativo (backend bug) no debe renderizarse.
+    if remaining >= 10 or remaining <= 0:
+        return gr.update(visible=False, value="")
+
+    # Concordancia singular/plural (verbo + sustantivo) cuando remaining == 1.
+    verbo = "queda" if remaining == 1 else "quedan"
+    noun = "clasificación" if remaining == 1 else "clasificaciones"
+    texto = f"Te {verbo} {remaining} {noun} hoy."
+
+    if remaining >= 5:
+        # Heads-up suave (5-9 restantes).
+        return gr.update(visible=True, value=texto)
+
+    # Alerta (1-4 restantes) — el emoji refuerza la escalation visual.
+    return gr.update(visible=True, value=f"⚠️ {texto}")
+
+
+def classify(audio_path: str | None, fingerprint: str | None, training_consent: bool):
     """Callback del boton Clasificar.
+
+    Inputs (orden importa, matchea inputs=[...] del .click() abajo):
+        0. audio_path        -> ruta del audio cargado
+        1. fingerprint       -> valor del gr.BrowserState (puede ser None/invalido)
+        2. training_consent  -> bool del consent_checkbox
 
     Outputs (orden importa, matchea el .click() abajo):
         0. result_group   -> visible True/False
@@ -255,6 +327,18 @@ def classify(audio_path: str | None):
         2. bird_photo     -> Image, path o None
         3. bird_info      -> Markdown con ficha
         4. label_out      -> dict {label: prob} para gr.Label
+        5. quota_indicator -> gr.update (escalating visibility de la cuota)
+
+    Asimetria posicional/keyword: Gradio pasa los inputs POSICIONALES; se
+    reenvian a ``predict()`` como KEYWORD-ONLY (``fingerprint=...``,
+    ``training_consent=...``) porque ``predict()`` los declara kw-only a
+    proposito (explicit dependency declaration en el cliente HTTP).
+
+    Fase 4d (A'): ``fingerprint`` se normaliza in-memory con
+    ``get_or_create_fingerprint`` apenas entra — si el BrowserState devolvio
+    None/invalido se regenera, asi ``predict()`` nunca recibe un fp corrupto
+    (un 400 por fingerprint daria un mensaje que culpa al audio). NO se
+    persiste de vuelta a localStorage; es solo normalizacion del valor.
 
     En CUALQUIER caso de error: el panel de resultado queda oculto y sus
     campos limpios; solo el error_box muestra el mensaje. Asi no queda un
@@ -266,6 +350,10 @@ def classify(audio_path: str | None):
     formas (bug en el wiring), ``validate_audio`` lo mapea a "unreadable"
     sin crashear.
     """
+    # Fase 4d (A'): normalizacion in-memory del fingerprint del BrowserState
+    # (ver docstring). get_or_create_fingerprint ya esta importado arriba.
+    fingerprint = get_or_create_fingerprint(fingerprint)
+
     # Fase 2 - Nivel 1: validacion inline antes de invocar la Lambda.
     # Si falla, ahorramos cold start y devolvemos un mensaje especifico.
     validation = validate_audio(audio_path)
@@ -275,9 +363,18 @@ def classify(audio_path: str | None):
             hidden[0],
             gr.update(visible=True, value=validation.error_message),
             hidden[1], hidden[2], hidden[3],
+            _format_quota_indicator(None),
         )
 
-    result = predict(audio_path, top_k=TOP_K)
+    result = predict(
+        audio_path,
+        top_k=TOP_K,
+        fingerprint=fingerprint,
+        training_consent=training_consent,
+    )
+    # Fase 4d.2d — indicador de cuota: se computa una vez del rate_info de
+    # esta respuesta y se reusa en todos los returns post-predict.
+    quota = _format_quota_indicator(result.rate_info)
 
     if not result.ok:
         if result.error_kind == "bad_request":
@@ -295,6 +392,7 @@ def classify(audio_path: str | None):
             hidden[0],
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
+            quota,
         )
 
     # Fase 2 - Nivel 2: backend rechazo el audio por gating. Mensaje
@@ -308,6 +406,7 @@ def classify(audio_path: str | None):
             hidden[0],
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
+            quota,
         )
 
     if not result.predictions:
@@ -316,6 +415,7 @@ def classify(audio_path: str | None):
             hidden[0],
             gr.update(visible=True, value="El servidor no devolvio predicciones."),
             hidden[1], hidden[2], hidden[3],
+            quota,
         )
 
     top1 = result.predictions[0]
@@ -333,6 +433,7 @@ def classify(audio_path: str | None):
         gr.update(value=photo, visible=photo is not None),  # bird_photo
         info_md,                                  # bird_info
         labels,                                   # label_out
+        quota,                                    # quota_indicator
     )
 
 
@@ -600,6 +701,14 @@ def _header_html() -> str:
 with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
     gr.HTML(_header_html())
 
+    # Estado app-wide (fuera de los tabs). El fingerprint persiste en
+    # localStorage del browser; se inicializa en el demo.load del final.
+    fingerprint_state = gr.BrowserState(
+        default_value=None,
+        storage_key="bird_classifier_fp",
+        secret=BROWSER_STATE_SECRET,
+    )
+
     with gr.Tabs():
         # ----- Tab 1: Clasificar -----
         with gr.Tab("Clasificar"):
@@ -620,6 +729,14 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                 # disabled. Solo se habilita cuando hay audio cargado.
                 status_hint = gr.Markdown(
                     value=_HINT_IDLE, elem_classes="status-hint"
+                )
+                # Consent opt-in (4d.2b): default DESMARCADO, SIN wiring.
+                # No tiene .change() ni es input de evento -> no dispara
+                # classify(). Su valor se leerá como input recién en 4d.2c.
+                consent_checkbox = gr.Checkbox(
+                    value=False,
+                    label=CONSENT_LABEL,
+                    elem_id="consent-checkbox",
                 )
                 submit = gr.Button(
                     "Clasificar",
@@ -646,6 +763,12 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                 label_out = gr.Label(
                     num_top_classes=TOP_K, label="Top 3 predicciones"
                 )
+
+            # Fase 4d.2d — indicador de cuota (escalating visibility). Oculto
+            # por default; classify() lo actualiza via _format_quota_indicator.
+            quota_indicator = gr.Markdown(
+                value="", visible=False, elem_id="quota-indicator"
+            )
 
             # ---- State machine wiring (Fase 2 - Nivel 1 UX) -----------------
             # IDLE inicial: el boton ya arranca con interactive=False y el hint
@@ -677,8 +800,11 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                 outputs=[submit, status_hint],
             ).then(
                 fn=classify,
-                inputs=audio_in,
-                outputs=[result_group, error_box, bird_photo, bird_info, label_out],
+                inputs=[audio_in, fingerprint_state, consent_checkbox],
+                outputs=[
+                    result_group, error_box, bird_photo, bird_info,
+                    label_out, quota_indicator,
+                ],
             ).then(
                 fn=_on_audio_change,
                 inputs=audio_in,
@@ -693,6 +819,15 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
             # Toda la galeria en UN solo gr.HTML para que el HTML inicial sea
             # liviano y las fotos se carguen lazy (solo al abrir el tab).
             gr.HTML(_render_species_gallery_html())
+
+    # Al cargar la app: reusa el fingerprint del browser si es válido, si no
+    # genera uno. demo.load corre per-sesión, después de que BrowserState
+    # hidrata desde localStorage.
+    demo.load(
+        fn=get_or_create_fingerprint,
+        inputs=[fingerprint_state],
+        outputs=[fingerprint_state],
+    )
 
 
 if __name__ == "__main__":
