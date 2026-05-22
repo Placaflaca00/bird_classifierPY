@@ -609,6 +609,7 @@ class TestPredictFase4:
         assert "top1_species" not in item
         assert "n_windows" not in item
         assert "max_birdnet_confidence" not in item
+        assert item["review_status"] == "pending"
 
     def test_desenlace_not_a_bird_escribe_item(self, mock_ddb, mock_pipeline):
         """Gate BirdNET no detecta ave -> 200 reason=not_a_bird + item con
@@ -625,6 +626,7 @@ class TestPredictFase4:
         assert item["n_windows"] == 3
         assert float(item["max_birdnet_confidence"]) == pytest.approx(0.05, abs=1e-4)
         assert "top1_species" not in item
+        assert item["review_status"] == "pending"
 
     def test_desenlace_detected_escribe_item_con_top3(self, mock_ddb,
                                                       mock_pipeline):
@@ -642,6 +644,7 @@ class TestPredictFase4:
         assert item["top1_species"] == "Chauna torquata"
         assert float(item["top1_confidence"]) == pytest.approx(0.95, abs=1e-4)
         assert len(item["top3_predictions"]) == 3
+        assert item["review_status"] == "pending"
 
     # --- Fase 8: resiliencia del write (fail-loud) -------------------------
     def test_write_idempotente_no_rompe_response(self, mock_ddb, mock_pipeline,
@@ -855,6 +858,29 @@ class TestFeedback:
         assert "#fcs = :cs" in kw["UpdateExpression"]
         assert kw["ExpressionAttributeNames"]["#fcs"] == "feedback_corrected_species"
         assert kw["ExpressionAttributeValues"][":cs"] == species
+
+    # --- Invariante capa-4 (human-in-the-loop): /feedback no toca review ---
+    @pytest.mark.parametrize("action",
+                             ["confirmed", "corrected", "rejected_as_non_bird"])
+    def test_feedback_no_modifica_review_status(self, mock_ddb, action):
+        """/feedback NUNCA escribe review_status — invariante de la capa 4 de
+        defense (human-in-the-loop). Un troll que evade las 3 capas defensivas
+        (spectral + BirdNET + classifier) e inyecta feedback sigue requiriendo
+        human approval antes de uso en training. El UpdateItem solo toca
+        feedback_* ; review_status queda intacto en su valor 'pending'."""
+        kwargs = {"action": action}
+        if action == "corrected":
+            kwargs["corrected_species"] = next(iter(h._VALID_SPECIES))
+        resp = h.handler(_feedback_event(**kwargs))
+        assert resp["statusCode"] == 200
+        kw = mock_ddb.update_item.call_args.kwargs
+        # review_status no aparece en NINGUNA parte del UpdateItem.
+        assert "review_status" not in kw["UpdateExpression"]
+        assert "review_status" not in kw["ExpressionAttributeNames"].values()
+        assert "review_status" not in kw.get("ConditionExpression", "")
+        # ...y feedback_status SI es el atributo que el update modifica.
+        assert kw["ExpressionAttributeNames"]["#fstatus"] == "feedback_status"
+        assert "#fstatus" in kw["UpdateExpression"]
 
     # --- ConditionalCheckFailed: 404 / 409 / 500-malformado ----------------
     def test_prediction_inexistente_devuelve_404(self, mock_ddb, ccfe_class):
