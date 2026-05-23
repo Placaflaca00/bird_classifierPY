@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import html as html_mod
 import json
+import threading
 from pathlib import Path
 
 import gradio as gr
 
-from client import predict, send_feedback
+from client import predict, send_feedback, warm_lambda
 from fingerprint import get_or_create_fingerprint
 from validation import validate_audio
 
@@ -332,6 +333,30 @@ def _feedback_reset(prediction_id: str | None, show_buttons: bool,
     )
 
 
+# Fase 5A.1 — outputs no-op para el bloque de feedback en error paths de
+# classify(). Preserva visibility y contenido de los 5 componentes (incluido
+# el prediction_id_state) — un error transitorio NO debe ocultar los botones
+# de feedback que vienen de una clasificacion exitosa anterior.
+#
+# Bug observable que arregla (Fase 5A.1): tras un primer intento que erra por
+# cold start del Lambda (API GW corta a 30s → "No se pudo conectar"), el
+# usuario reintenta y clasifica OK, pero los botones de feedback no aparecen.
+# Causa: el error path llamaba `_feedback_reset(None, False, gr.update())`,
+# que mandaba `gr.update(visible=False)` sobre feedback_buttons_group. El fix
+# es preservar el estado actual del bloque en error paths — los botones
+# solo deben aparecer/ocultarse en transiciones exitosas/iniciales.
+#
+# Si los botones quedan visibles tras un error, refieren a la ULTIMA
+# prediccion exitosa (cuyo prediction_id se preserva en el State); un click
+# en 👍/👎 manda feedback sobre esa, no sobre el intento fallido — lo cual
+# es semanticamente correcto.
+def _feedback_preserve_all() -> tuple:
+    """5-tupla de gr.update() no-op: preserva el estado actual de los 5
+    componentes de feedback. Usado en TODOS los error paths de classify().
+    """
+    return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+
+
 def classify(audio_path: str | None, fingerprint: str | None, training_consent: bool):
     """Callback del boton Clasificar.
 
@@ -389,7 +414,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value=validation.error_message),
             hidden[1], hidden[2], hidden[3],
             _format_quota_indicator(None),
-            *_feedback_reset(None, False, gr.update()),
+            *_feedback_preserve_all(),
         )
 
     result = predict(
@@ -413,13 +438,24 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             msg = _ERROR_MESSAGES.get(
                 result.error_kind, "Ocurrio un error inesperado."
             )
+        # Fase 5A.1: toast extra en errores de cold-start aún despues del retry
+        # del client.py. Si el usuario llega aca con timeout/network, ya hubo
+        # 2 intentos contra el backend (timeout total ~35s + 60s = 95s) y aun
+        # asi fallo — el container probablemente esta tomando >60s o hay un
+        # problema de red. El toast da contexto adicional al texto del error.
+        if result.error_kind in ("timeout", "network"):
+            gr.Warning(
+                "El servidor sigue iniciandose o tu conexion esta inestable. "
+                "Esperá unos segundos y volvé a probar — la siguiente request "
+                "deberia ser casi instantanea."
+            )
         hidden = _hidden_result()
         return (
             hidden[0],
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
             quota,
-            *_feedback_reset(None, False, gr.update()),
+            *_feedback_preserve_all(),
         )
 
     # Fase 2 - Nivel 2: backend rechazo el audio por gating. Mensaje
@@ -434,7 +470,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value=msg),
             hidden[1], hidden[2], hidden[3],
             quota,
-            *_feedback_reset(None, False, gr.update()),
+            *_feedback_preserve_all(),
         )
 
     if not result.predictions:
@@ -444,7 +480,7 @@ def classify(audio_path: str | None, fingerprint: str | None, training_consent: 
             gr.update(visible=True, value="El servidor no devolvio predicciones."),
             hidden[1], hidden[2], hidden[3],
             quota,
-            *_feedback_reset(None, False, gr.update()),
+            *_feedback_preserve_all(),
         )
 
     top1 = result.predictions[0]
@@ -1099,11 +1135,22 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
             # liviano y las fotos se carguen lazy (solo al abrir el tab).
             gr.HTML(_render_species_gallery_html())
 
-    # Al cargar la app: reusa el fingerprint del browser si es válido, si no
-    # genera uno. demo.load corre per-sesión, después de que BrowserState
-    # hidrata desde localStorage.
+    # Al cargar la app: (1) dispara warm fire-and-forget al Lambda (Fase 5A.2)
+    # y (2) reusa/regenera el fingerprint. demo.load corre per-sesion del lado
+    # del Space, despues de que BrowserState hidrata desde localStorage.
+    #
+    # El warm va en un thread daemon: kick + retorno inmediato. NO esperamos
+    # respuesta — si el cold start del Lambda tarda 30s, no queremos retrasar
+    # el render de la pagina. El usuario tipicamente tarda 5-15s en seleccionar
+    # un audio y clickear, lo cual da tiempo al container a warmarse en
+    # background. Si el usuario clickea instantaneo, paga el cold start de
+    # todas formas (el thread del demo.load es additive, no bloqueante).
+    def _on_demo_load(fp: str | None) -> str:
+        threading.Thread(target=warm_lambda, daemon=True).start()
+        return get_or_create_fingerprint(fp)
+
     demo.load(
-        fn=get_or_create_fingerprint,
+        fn=_on_demo_load,
         inputs=[fingerprint_state],
         outputs=[fingerprint_state],
     )

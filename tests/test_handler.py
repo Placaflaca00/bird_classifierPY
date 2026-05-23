@@ -935,3 +935,130 @@ class TestFeedback:
             rec.levelname == "ERROR" and "UpdateItem /feedback" in rec.getMessage()
             for rec in caplog.records
         )
+
+
+# ===========================================================================
+# Fase 5A.2 — warm path (anti cold start)
+# ===========================================================================
+class TestIsWarmInvoke:
+    """``_is_warm_invoke`` detecta el flag en top-level Y body (JSON string +
+    dict). Esto cubre los 3 productores posibles: EventBridge invoke directo
+    (top-level), API GW HTTP con body string, test/dev con body dict."""
+
+    def test_top_level_warm_true(self) -> None:
+        assert h._is_warm_invoke({"warm": True}) is True
+
+    def test_top_level_warm_false(self) -> None:
+        assert h._is_warm_invoke({"warm": False}) is False
+
+    def test_top_level_sin_warm(self) -> None:
+        assert h._is_warm_invoke({"rawPath": "/predict"}) is False
+
+    def test_body_string_json(self) -> None:
+        assert h._is_warm_invoke({"body": '{"warm": true}'}) is True
+
+    def test_body_dict(self) -> None:
+        assert h._is_warm_invoke({"body": {"warm": True}}) is True
+
+    def test_body_string_invalid_json(self) -> None:
+        """JSON malformado en body NO matchea warm — el path normal devuelve 400."""
+        assert h._is_warm_invoke({"body": "not-json-at-all"}) is False
+
+    def test_body_string_otro_payload(self) -> None:
+        assert h._is_warm_invoke({"body": '{"audio_b64": "abc"}'}) is False
+
+    def test_evento_vacio(self) -> None:
+        assert h._is_warm_invoke({}) is False
+
+
+class TestWarmHandler:
+    """``handler()`` con ``{"warm": True}`` dispara ``_warm_pipeline`` y
+    retorna 200 ANTES del routing. NO debe tocar DDB ni S3 — el branch es
+    pre-validation y pre-rate-limit por diseno."""
+
+    def test_warm_top_level_dispara_pipeline_y_retorna_200(
+        self, monkeypatch, mock_ddb,
+    ) -> None:
+        calls = []
+        monkeypatch.setattr(h, "_warm_pipeline", lambda: calls.append("warmed"))
+
+        resp = h.handler({"warm": True})
+
+        assert resp["statusCode"] == 200
+        assert json.loads(resp["body"]) == {"warm": True}
+        assert calls == ["warmed"]
+        # GUARDRAIL 1: warm NO toca DynamoDB.
+        mock_ddb.update_item.assert_not_called()
+        mock_ddb.put_item.assert_not_called()
+
+    def test_warm_via_body_string_dispara_pipeline(
+        self, monkeypatch, mock_ddb,
+    ) -> None:
+        """Warm via API GW HTTP — body llega como string JSON."""
+        calls = []
+        monkeypatch.setattr(h, "_warm_pipeline", lambda: calls.append("warmed"))
+
+        resp = h.handler({"rawPath": "/predict", "body": '{"warm": true}'})
+
+        assert resp["statusCode"] == 200
+        assert calls == ["warmed"]
+        mock_ddb.update_item.assert_not_called()
+
+    def test_warm_pipeline_falla_devuelve_200_y_no_rompe(
+        self, monkeypatch, caplog, mock_ddb,
+    ) -> None:
+        """Warm es defensa: si el pipeline raises (un JIT cae, lo que sea),
+        retornamos 200 igual y logueamos WARN. NO debe propagar el error al
+        cliente — el container queda vivo y la proxima request real saldra
+        del cold start."""
+        def _boom():
+            raise RuntimeError("librosa explotó")
+        monkeypatch.setattr(h, "_warm_pipeline", _boom)
+
+        with caplog.at_level(logging.WARNING):
+            resp = h.handler({"warm": True})
+
+        assert resp["statusCode"] == 200
+        assert any(
+            "warm pipeline fallo" in rec.getMessage()
+            for rec in caplog.records
+        )
+        mock_ddb.update_item.assert_not_called()
+
+    def test_path_normal_NO_dispara_warm(
+        self, monkeypatch, mock_ddb, mock_pipeline,
+    ) -> None:
+        """Un /predict normal no debe invocar _warm_pipeline."""
+        calls = []
+        monkeypatch.setattr(h, "_warm_pipeline", lambda: calls.append("warmed"))
+        _setup_desenlace(mock_pipeline, "detected")
+
+        resp = h.handler(_predict_event())
+
+        assert resp["statusCode"] == 200
+        assert calls == []  # _warm_pipeline nunca se llamo
+        # Path normal SI escribe a DDB (rate limit + PutItem).
+        assert mock_ddb.update_item.called
+        assert mock_ddb.put_item.called
+
+
+class TestWarmPipeline:
+    """``_warm_pipeline`` ejercita las funciones de librosa que tienen numba
+    JIT lazy + un pase por TFLite + ONNX. Test smoke: que corre sin levantar
+    excepciones y completa. NO es un benchmark — solo verifica que el dummy
+    WAV es valido y el flow no rompe."""
+
+    def test_warm_pipeline_completa_sin_error(self) -> None:
+        """End-to-end real: dummy WAV -> librosa.load -> spectral funcs ->
+        BirdNET -> ONNX. Si esto pasa, el flow esta intacto y el warming
+        verdaderamente warmea todos los paths.
+        """
+        h._warm_pipeline()  # no debe raise
+
+    def test_dummy_wav_bytes_es_riff_valido(self) -> None:
+        """El blob module-level es un WAV bien formado (header RIFF + WAVE)."""
+        assert h._DUMMY_WAV_BYTES[:4] == b"RIFF"
+        assert h._DUMMY_WAV_BYTES[8:12] == b"WAVE"
+        # 1 s @ 22050 Hz mono PCM16 = 22050 samples × 2 bytes = 44100 bytes
+        # + 44 bytes de header = 44144 bytes total.
+        assert len(h._DUMMY_WAV_BYTES) == 44144

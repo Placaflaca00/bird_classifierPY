@@ -248,6 +248,80 @@ _CLASSIFIER_SESS, _IDX_TO_SPECIES, _CLASSIFIER_META = _load_classifier()
 _SPECIES_META = _load_species_metadata()
 _NUM_CLASSES = len(_IDX_TO_SPECIES)
 
+
+# ---------------------------------------------------------------------------
+# Fase 5A — warm pipeline (anti cold start)
+# ---------------------------------------------------------------------------
+# Generamos un WAV dummy una vez al cargar el modulo: 1 s de "noise blanco
+# suave" @ 22050 Hz mono PCM16. Lo usa `_warm_pipeline()` cuando el handler
+# recibe {"warm": true} (EventBridge cada 7 min + demo.load del frontend).
+#
+# Sample rate 22050 (NO 48000) a proposito: librosa.load(sr=48000) resamplea
+# del dummy a la SR target, lo que dispara la JIT compilation de resampy/soxr
+# (la ruta resample-numba es de las mas caras del cold start efectivo). Si
+# usaramos 48000 ya, librosa skipearia el resample y dejariamos esa ruta cold.
+#
+# Amplitude baja (~2% del rango int16): suficiente para que librosa.load
+# devuelva un vector no-trivial; no nos importa que el filtro espectral lo
+# rechazaria como "white_noise" porque en el warm path llamamos las funciones
+# de librosa.feature.* DIRECTAMENTE (no via _classify_synthetic), ignorando
+# el output. Lo que warmamos es el JIT, no la decision.
+def _make_dummy_wav_bytes() -> bytes:
+    """1s noise @ 22050Hz mono PCM16 WAV para warmup. Determinista (seed=42)."""
+    import struct as _struct  # local: solo se usa al cargar el modulo
+
+    n_samples = 22050
+    rng = np.random.default_rng(seed=42)
+    samples_int16 = (rng.standard_normal(n_samples) * 800).astype(np.int16)
+    audio = samples_int16.tobytes()
+    header = (
+        b"RIFF" + _struct.pack("<I", 36 + len(audio))
+        + b"WAVE" + b"fmt " + _struct.pack("<I", 16)
+        + _struct.pack("<HHIIHH", 1, 1, 22050, 22050 * 2, 2, 16)
+        + b"data" + _struct.pack("<I", len(audio))
+    )
+    return header + audio
+
+
+_DUMMY_WAV_BYTES = _make_dummy_wav_bytes()
+
+
+def _warm_pipeline() -> None:
+    """Ejecuta el pipeline completo con audio dummy — warmer post-init.
+
+    Cubre las rutas con costo de "primera ejecucion" que NO se warman solo con
+    init module-level:
+      1. ``import librosa`` (lazy en _load_audio_bytes y _classify_synthetic).
+      2. ``librosa.load`` con resample 22050->48000 (resampy/soxr numba JIT).
+      3. ``librosa.feature.spectral_flatness`` / ``rms`` / ``spectral_bandwidth``
+         — las 3 son numba-JIT y suman ~5-15 s la primera vez. Las llamamos
+         directamente (no via ``_classify_synthetic``) porque ese helper
+         puede saltarse ``spectral_bandwidth`` cuando flat_mean es alto, y
+         queremos garantizar JIT compile de las 3.
+      4. ``_embed`` ejecuta el TFLite interpreter con un tensor real (el init
+         del module solo hace allocate_tensors, no invoca).
+      5. ``_classify`` ejecuta la ONNX session por primera vez (graph
+         optimization se completa, kernel cache se llena).
+
+    NO toca DynamoDB ni S3 — branch en el handler garantiza que esta funcion
+    solo corre cuando ``event["warm"] is True``, sin pasar por validation ni
+    rate limit ni write paths.
+
+    Costo medido (post-init, warm): ~150-250 ms. Costo en cold con todos los
+    JIT pendientes: ~5-15 s. El cold corre dentro del init-in-handler del
+    primer warm invoke; el resto son barato.
+    """
+    import librosa  # lazy en el path normal, lo forzamos aca para warmar
+
+    y, _ = librosa.load(
+        io.BytesIO(_DUMMY_WAV_BYTES), sr=SAMPLE_RATE, mono=True,
+    )
+    librosa.feature.spectral_flatness(y=y)
+    librosa.feature.rms(y=y)
+    librosa.feature.spectral_bandwidth(y=y, sr=SAMPLE_RATE)
+    embedding, _, _ = _embed(y)
+    _classify(embedding, top_k=DEFAULT_TOP_K)
+
 # Fase 4c — constantes de validacion del endpoint /feedback.
 # _FEEDBACK_ACTIONS: discriminator del body (patron OpenAPI oneOf); cada valor
 #   define que campos extra son validos (ver _handle_feedback).
@@ -814,13 +888,64 @@ def handler(event: dict, context: Any = None) -> dict:
     misma Lambda function ARN — API Gateway routea 3 paths al mismo Lambda
     y nosotros despachamos internamente. Mas barato que 3 Lambdas separadas
     (sin cold start duplicado).
+
+    Fase 5A — warm path: si el invoke trae ``{"warm": true}`` (EventBridge
+    Scheduler cada 7 min + demo.load del frontend), ejecutamos el pipeline
+    dummy ANTES del routing y retornamos. Este branch es deliberadamente
+    PRE-validation y PRE-rate-limit: el warm NO debe consumir cuota del
+    fingerprint default, NO debe loguear un PREDICTION en DDB, NO debe leer
+    de S3. Solo ejercita CPU paths (librosa JIT, TFLite, ONNX) y se va.
+
+    Detection: leemos ``event.get("warm")`` directo del top-level del event,
+    NO de body. API Gateway nunca produce ese campo; lo unicos productores
+    son EventBridge (invoca Lambda directo con el payload) y el cliente
+    nuestro vía body (que parseamos abajo en el path normal con presencia
+    de la key del top-level — ver "Warm via API GW" abajo).
+
+    Warm via API GW: si el frontend manda ``{"warm": true}`` por HTTP POST
+    a cualquier path, API GW wrappea ese JSON en event["body"] (string).
+    Para soportar ese caso ademas del invoke directo, chequeamos ambos.
     """
+    if _is_warm_invoke(event):
+        try:
+            _warm_pipeline()
+        except Exception as e:  # noqa: BLE001 — warm no debe romper el container
+            logger.warning(
+                "warm pipeline fallo (ignorado)",
+                extra={"error_type": type(e).__name__, "error_msg": str(e)},
+            )
+        return _response(200, {"warm": True})
+
     raw_path = event.get("rawPath") or event.get("path") or ""
     if raw_path.endswith("/upload-url"):
         return _handle_upload_url(event)
     if raw_path.endswith("/feedback"):
         return _handle_feedback(event)
     return _handle_predict(event)
+
+
+def _is_warm_invoke(event: dict) -> bool:
+    """True si el event es un warm — chequea top-level + body.
+
+    Top-level ``event["warm"]`` -> invoke directo (EventBridge Scheduler).
+    Body parseado ``event["body"]`` con ``{"warm": true}`` -> via API GW HTTP.
+
+    No usa ``_parse_body`` porque queremos fallar SILENT si el body es
+    invalido y dejar que el path normal lo maneje con un 400. El warm
+    detection es additive, no debe interferir con el flow de error normal.
+    """
+    if event.get("warm") is True:
+        return True
+    body = event.get("body")
+    if isinstance(body, str):
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            return False
+        return isinstance(parsed, dict) and parsed.get("warm") is True
+    if isinstance(body, dict):
+        return body.get("warm") is True
+    return False
 
 
 def _handle_upload_url(event: dict) -> dict:

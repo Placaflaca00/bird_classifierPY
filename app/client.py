@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -79,9 +80,29 @@ _load_dotenv()
 API_URL_ENV = "API_GATEWAY_URL"
 DEFAULT_TOP_K = 3
 
-# (connect, read) en segundos. El read es alto a propósito: el cold start
-# medido en Fase 1 fue ~26.8 s y el cap de integración del HTTP API es 30 s.
+# (connect, read) en segundos. El read es alto a propósito: el cap de
+# integración del HTTP API es 30 s, así que esperar más del lado cliente solo
+# acumula latencia sin servir — si la API GW no respondió en 30 s, ya cerró
+# la conexión.
 REQUEST_TIMEOUT: tuple[float, float] = (5.0, 35.0)
+
+# Cold-start retry: si el primer POST /predict falla con cierre abrupto de
+# conexión por API GW (cap 30 s) o 5xx, se reintenta UNA vez con backoff +
+# read timeout extendido. El read 60 s del reintento NO espera más que API GW
+# (que sigue capeada a 30 s) — espera más que el cap por dos razones:
+#   1. El container ya está warm en el reintento (Lambda quedó vivo después
+#      de servir el primero) y la respuesta llega en ~1-5 s. El extra es
+#      headroom defensivo.
+#   2. Algunas latencias borderline (conexión 4G floja, edge CloudFront frío)
+#      se manifiestan como read lento pero no como cierre. El extra cubre eso.
+COLD_START_RETRY_TIMEOUT: tuple[float, float] = (5.0, 60.0)
+COLD_START_RETRY_BACKOFF_S = 2.0
+# error_kind retryables: timeout (504 o cliente lo detectó), network
+# (ConnectionError = API GW cortó conexión sin response — esta es la firma
+# real del cold start observado en prod), server (5xx, incluído 502/504 del
+# integration layer), throttled (503 transitorio cuando API GW se queda sin
+# capacity post-cold-start).
+COLD_START_RETRY_ERROR_KINDS = frozenset({"timeout", "network", "server", "throttled"})
 
 # Fase 3: timeouts separados.
 # - /upload-url: sin BirdNET, super rapido (solo genera URL). Cap chico.
@@ -588,16 +609,27 @@ def predict(
             error_message=f"no se pudo subir el audio: {s3_err}",
         )
 
-    # --- Step 4: POST /predict con s3_key ------------------------------
+    # --- Step 4: POST /predict con s3_key + cold-start retry -----------
     body = {
         "s3_key": upload.s3_key,
         "top_k": int(top_k),
         "fingerprint": fingerprint,
         "training_consent": bool(training_consent),
     }
+    return _post_predict_with_retry(url, body)
 
+
+def _do_post_predict(
+    url: str, body: dict, timeout: tuple[float, float],
+) -> PredictResult:
+    """Un solo intento de POST /predict. Mapea respuesta o excepción a
+    PredictResult sin reintentar.
+
+    Extraído para que ``_post_predict_with_retry`` pueda invocarlo dos veces
+    con timeouts distintos sin duplicar el bloque try/except.
+    """
     try:
-        resp = _get_session().post(url, json=body, timeout=REQUEST_TIMEOUT)
+        resp = _get_session().post(url, json=body, timeout=timeout)
     except requests.exceptions.RetryError:
         return PredictResult(
             ok=False, error_kind="throttled",
@@ -620,6 +652,74 @@ def predict(
         )
 
     return _map_response(resp)
+
+
+def _post_predict_with_retry(url: str, body: dict) -> PredictResult:
+    """POST /predict con retry de 1 en caso de cold start.
+
+    Patología medida en prod (CloudWatch + Fase 5A.1):
+      - Container cold + init phase de 10 s (cap del Lambda image init) →
+        fallback a init-in-handler → Duration 30-42 s.
+      - API Gateway HTTP API tiene cap de integración de 30 s. Cuando se
+        excede, **cierra la conexión sin response** (en vez de un 504 limpio);
+        ``requests`` ve un ``ConnectionError`` o ``Timeout``, no un response
+        HTTP. Después del cierre, Lambda sigue ejecutando hasta su propio
+        timeout (90 s) y el container queda warm para la próxima invocación.
+      - El reintento llega a un container ya warm → respuesta en ~1-5 s.
+
+    Estrategia:
+      1. Primer intento con timeout normal (REQUEST_TIMEOUT, read 35 s).
+      2. Si falla con error_kind retryable (timeout/network/server/throttled),
+         backoff de 2 s + retry con timeout extendido (60 s read).
+      3. Si el primer intento fue exitoso o falla con un error NO transitorio
+         (bad_request, rate_limited, config, bad_response), NO reintentar:
+         son errores terminales del request o config.
+
+    Rate-limited NO se reintenta (es la directiva explícita del .Session vía
+    RETRY_STATUS = (503,) y vía rate_limited not in COLD_START_RETRY_ERROR_KINDS):
+    cuota diaria agotada del backend, reintentar gasta tiempo en algo que no
+    va a cambiar hasta el próximo reset.
+    """
+    first = _do_post_predict(url, body, REQUEST_TIMEOUT)
+    if first.ok or first.error_kind not in COLD_START_RETRY_ERROR_KINDS:
+        return first
+
+    time.sleep(COLD_START_RETRY_BACKOFF_S)
+    return _do_post_predict(url, body, COLD_START_RETRY_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# Warm pre-load (Fase 5A.2)
+# ---------------------------------------------------------------------------
+def warm_lambda(api_url: str | None = None) -> None:
+    """Fire-and-forget POST ``{"warm": true}`` al endpoint — pre-load del Lambda.
+
+    Pensado para llamarse desde un thread daemon en ``demo.load()`` del
+    frontend: dispara el warm pipeline del Lambda (ver
+    ``lambda/handler.py:_warm_pipeline``) cuando un usuario abre el Space,
+    para que el container esté warm + JIT compilado antes del primer
+    Clasificar real.
+
+    El backend detecta el flag ``warm`` y branch antes de cualquier write a
+    DDB / S3 — esta llamada NO consume cuota del rate limit ni loguea
+    PREDICTION items.
+
+    Errores se silencian: warm es defensa, no critical path. Si el endpoint
+    está caido o sin red, el usuario verá el error real cuando intente
+    clasificar — preferible a romper el demo.load.
+
+    Timeout (5/15): warm sobre container warm vuelve en <1s, sobre cold
+    puede tardar mucho (init phase del Lambda). 15s es un cap razonable que
+    libera el thread sin esperar el cold start completo — el container sigue
+    warmandose del lado del Lambda igual, beneficiando requests siguientes.
+    """
+    url = _resolve_api_url(api_url)
+    if not url:
+        return
+    try:
+        _get_session().post(url, json={"warm": True}, timeout=(5.0, 15.0))
+    except Exception as e:  # noqa: BLE001 — fire-and-forget defensivo
+        print(f"[warm_lambda] ignored: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

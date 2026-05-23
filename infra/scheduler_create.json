@@ -1,0 +1,19 @@
+{
+  "Name": "bird-classifier-py-warm",
+  "Description": "Pre-warm bird-classifier-py-inference every 7 min to avoid Lambda cold start + librosa numba JIT recompilation. Triggers _warm_pipeline() in handler.py via {\"warm\":true} payload.",
+  "ScheduleExpression": "rate(7 minutes)",
+  "ScheduleExpressionTimezone": "UTC",
+  "FlexibleTimeWindow": {
+    "Mode": "OFF"
+  },
+  "State": "DISABLED",
+  "Target": {
+    "Arn": "arn:aws:lambda:us-east-1:863518416901:function:bird-classifier-py-inference",
+    "RoleArn": "arn:aws:iam::863518416901:role/bird-classifier-py-warm-scheduler",
+    "Input": "{\"warm\":true}",
+    "RetryPolicy": {
+      "MaximumRetryAttempts": 0,
+      "MaximumEventAgeInSeconds": 60
+    }
+  }
+}

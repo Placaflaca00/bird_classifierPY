@@ -260,12 +260,18 @@ class TestPredictFullFlow:
         # Solo 1 POST al session (upload-url); el predict no se llamó.
         assert mock_session.post.call_count == 1
 
+    @patch("client.time.sleep")
     @patch("client.requests.put")
     @patch.object(c, "_get_session")
     def test_fails_at_predict_lambda(
-        self, mock_session_factory: MagicMock, mock_put: MagicMock, tmp_path: Path,
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
     ) -> None:
-        """Steps 1+2+3 OK, paso final /predict devuelve 500."""
+        """Steps 1+2+3 OK, paso final /predict devuelve 500 persistente.
+
+        Fase 5A.1: 500 es retryable, así que el client reintenta 1 vez. Si
+        ambos intentos fallan con 500, el error final es 'server'.
+        """
         audio_file = tmp_path / "test.mp3"
         audio_file.write_bytes(b"bytes")
 
@@ -274,10 +280,12 @@ class TestPredictFullFlow:
             "s3_key": "uploads/x.mp3",
             "content_type": "audio/mpeg",
         })
-        predict_resp = _mock_response(500, {"error": "lambda boom"})
+        # 2 intentos al /predict, ambos 500 (lambda persistentemente roto).
+        predict_resp_1 = _mock_response(500, {"error": "lambda boom"})
+        predict_resp_2 = _mock_response(500, {"error": "lambda boom"})
 
         mock_session = MagicMock()
-        mock_session.post.side_effect = [upload_resp, predict_resp]
+        mock_session.post.side_effect = [upload_resp, predict_resp_1, predict_resp_2]
         mock_session_factory.return_value = mock_session
 
         mock_put.return_value = _mock_response(200)
@@ -286,9 +294,10 @@ class TestPredictFullFlow:
 
         assert result.ok is False
         assert result.error_kind == "server"
-        # Los 3 calls se hicieron (S3 OK, falla en el ultimo).
-        assert mock_session.post.call_count == 2
+        # 3 POSTs: upload-url + predict-fail-1 + predict-retry-fail-2.
+        assert mock_session.post.call_count == 3
         assert mock_put.call_count == 1
+        mock_sleep.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +312,192 @@ class TestRetryConfig:
         retry = c._build_session().get_adapter("https://x").max_retries
         assert 429 not in retry.status_forcelist
         assert 503 in retry.status_forcelist
+
+
+# Fase 5A.1 — cold-start retry del cliente. El segundo intento de POST /predict
+# se dispara cuando el primero falla con error transitorio (cold start de
+# Lambda cortado por el cap 30s del API GW HTTP API).
+class TestColdStartRetry:
+    URL = "https://api.test/prod/predict"
+
+    def _upload_resp(self) -> MagicMock:
+        return _mock_response(200, {
+            "upload_url": "https://s3.test/url", "s3_key": "uploads/x.mp3",
+            "content_type": "audio/mpeg",
+        })
+
+    def _predict_ok_resp(self) -> MagicMock:
+        return _mock_response(200, {
+            "predictions": [{"species": "Test bird", "confidence": 0.9}],
+            "prediction_id": _PRED_ID,
+            "rate_info": {"requests_today": 1, "limit": 30, "remaining": 29},
+        })
+
+    @patch("client.time.sleep")  # acelera el test, evita el backoff de 2s real
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_retry_en_connection_error_recupera(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """Primer intento ConnectionError (API GW cierra abruptamente cold
+        start) → retry con backoff → segundo intento OK."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        mock_session = MagicMock()
+        # 3 POSTs en orden: upload-url, predict (fail), predict (retry ok).
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            requests.exceptions.ConnectionError("connection reset"),
+            self._predict_ok_resp(),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is True
+        assert result.prediction_id == _PRED_ID
+        # 3 POSTs (upload-url + predict-fail + predict-retry); 1 sleep.
+        assert mock_session.post.call_count == 3
+        mock_sleep.assert_called_once_with(c.COLD_START_RETRY_BACKOFF_S)
+        # El reintento usa timeout extendido (60s read).
+        retry_call = mock_session.post.call_args_list[2]
+        assert retry_call.kwargs["timeout"] == c.COLD_START_RETRY_TIMEOUT
+
+    @patch("client.time.sleep")
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_retry_en_timeout_recupera(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """Primer intento Timeout → retry → segundo intento OK."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            requests.exceptions.Timeout("read timeout"),
+            self._predict_ok_resp(),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is True
+        assert mock_session.post.call_count == 3
+        mock_sleep.assert_called_once()
+
+    @patch("client.time.sleep")
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_retry_en_500_recupera(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """Primer intento HTTP 500 → retry → segundo intento OK."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            _mock_response(500, {"error": "internal"}),
+            self._predict_ok_resp(),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is True
+        assert mock_session.post.call_count == 3
+
+    @patch("client.time.sleep")
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_NO_retry_en_429(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """429 (rate_limited) es terminal: NO se reintenta."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        rate_info = {"requests_today": 30, "limit": 30, "remaining": 0}
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            _mock_response(429, {"error": "limit", "rate_info": rate_info}),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "rate_limited"
+        # Solo 2 POSTs (upload-url + predict), NO hubo retry, NO hubo sleep.
+        assert mock_session.post.call_count == 2
+        mock_sleep.assert_not_called()
+
+    @patch("client.time.sleep")
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_NO_retry_en_400(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """400 (bad_request, fingerprint inválido por ej.) es terminal."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            _mock_response(400, {"error": "fingerprint inválido"}),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "bad_request"
+        assert mock_session.post.call_count == 2
+        mock_sleep.assert_not_called()
+
+    @patch("client.time.sleep")
+    @patch("client.requests.put")
+    @patch.object(c, "_get_session")
+    def test_retry_tambien_falla_propaga_error(
+        self, mock_session_factory: MagicMock, mock_put: MagicMock,
+        mock_sleep: MagicMock, tmp_path: Path,
+    ) -> None:
+        """Si ambos intentos fallan con ConnectionError: error_kind=network."""
+        audio_file = tmp_path / "test.mp3"
+        audio_file.write_bytes(b"bytes")
+
+        mock_session = MagicMock()
+        mock_session.post.side_effect = [
+            self._upload_resp(),
+            requests.exceptions.ConnectionError("first fail"),
+            requests.exceptions.ConnectionError("second fail"),
+        ]
+        mock_session_factory.return_value = mock_session
+        mock_put.return_value = _mock_response(200)
+
+        result = c.predict(str(audio_file), fingerprint=_FP, api_url=self.URL)
+
+        assert result.ok is False
+        assert result.error_kind == "network"
+        # 3 POSTs (upload-url + 2 predict attempts), 1 sleep.
+        assert mock_session.post.call_count == 3
+        mock_sleep.assert_called_once()
 
 
 class TestPredictRateLimitAndIds:

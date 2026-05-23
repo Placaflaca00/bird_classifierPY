@@ -1,0 +1,8 @@
+{
+  "ApiId": "1jbbnu85e5",
+  "StageName": "prod",
+  "AccessLogSettings": {
+    "DestinationArn": "arn:aws:logs:us-east-1:863518416901:log-group:/aws/apigateway/bird-classifier-py-api",
+    "Format": "{\"requestId\":\"$context.requestId\",\"requestTime\":\"$context.requestTime\",\"httpMethod\":\"$context.httpMethod\",\"routeKey\":\"$context.routeKey\",\"status\":\"$context.status\",\"integrationStatus\":\"$context.integrationStatus\",\"integrationLatency\":\"$context.integrationLatency\",\"responseLatency\":\"$context.responseLatency\",\"integrationErrorMessage\":\"$context.integrationErrorMessage\",\"protocol\":\"$context.protocol\",\"userAgent\":\"$context.identity.userAgent\"}"
+  }
+}
