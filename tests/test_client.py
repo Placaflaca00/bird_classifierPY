@@ -153,6 +153,42 @@ class TestUploadToS3:
         assert err is not None
         assert "timeout" in err.lower()
 
+    @patch("client.requests.put")
+    def test_envia_header_x_amz_tagging_cuando_se_provee(
+        self, mock_put: MagicMock,
+    ) -> None:
+        """Fase 5B — si el backend firmo Tagging en el presigned, el cliente
+        DEBE mandar el header matching o S3 rechaza con SignatureDoesNotMatch.
+        """
+        mock_put.return_value = _mock_response(200)
+
+        ok, err = c._upload_to_s3(
+            "https://s3.test/url", b"bytes", "audio/mpeg",
+            tagging="retain=false",
+        )
+
+        assert ok is True
+        call = mock_put.call_args
+        assert call.kwargs["headers"]["x-amz-tagging"] == "retain=false"
+        assert call.kwargs["headers"]["Content-Type"] == "audio/mpeg"
+
+    @patch("client.requests.put")
+    def test_no_envia_x_amz_tagging_si_no_se_provee(
+        self, mock_put: MagicMock,
+    ) -> None:
+        """Retrocompat con backend pre-5B: tagging=None → no se manda header.
+        Si se mandara con presigned viejo, S3 lo rechaza con 403.
+        """
+        mock_put.return_value = _mock_response(200)
+
+        ok, err = c._upload_to_s3(
+            "https://s3.test/url", b"bytes", "audio/mpeg",
+        )
+
+        assert ok is True
+        call = mock_put.call_args
+        assert "x-amz-tagging" not in call.kwargs["headers"]
+
 
 # ---------------------------------------------------------------------------
 # predict (full flow — 3 pasos)

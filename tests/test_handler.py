@@ -353,6 +353,11 @@ class TestUploadUrl:
         assert call.kwargs["HttpMethod"] == "PUT"
         assert call.kwargs["Params"]["ContentType"] == "audio/mpeg"
         assert call.kwargs["Params"]["Bucket"] == h.S3_UPLOADS_BUCKET
+        # Fase 5B — Tagging firmado en el presigned con retain=false default.
+        assert call.kwargs["Params"]["Tagging"] == "retain=false"
+        # Response tambien expone el tagging al cliente — sin esto el
+        # frontend no sabe que header mandar al PUT.
+        assert body["tagging"] == "retain=false"
 
     def test_handle_upload_url_invalid_ext(self, mock_s3):
         """ext no whitelisted (exe) -> 400, NO toca S3."""
@@ -935,6 +940,154 @@ class TestFeedback:
             rec.levelname == "ERROR" and "UpdateItem /feedback" in rec.getMessage()
             for rec in caplog.records
         )
+
+
+# ===========================================================================
+# Fase 5B — S3 retention via PutObjectTagging desde /feedback con consent
+# ===========================================================================
+class TestFeedbackRetention:
+    """Cuando /feedback aplica feedback sobre un PREDICTION cuyo
+    training_consent=True, el handler retaguea el objeto S3 a retain=true
+    para que sobreviva la lifecycle rule de 30d.
+
+    Tests:
+      - consent=True + s3_key → PutObjectTagging con TagSet retain=true.
+      - consent=False → NO se llama PutObjectTagging, retained=false.
+      - s3_key ausente (audio_b64 flow legacy) → NO se llama, retained=false.
+      - NoSuchKey (audio ya expirado): log ERROR, response 200 con
+        retained=false (feedback principal triunfó, no rompemos por audit).
+      - Error generico S3: log ERROR, retained=false.
+
+    Para los tests con consent=True, mockeamos update_item.return_value para
+    que devuelva el ``Attributes`` post-update con training_consent + s3_key.
+    El resource API (a diferencia del ALL_OLD del exception) deserializa
+    estos a tipos Python nativos.
+    """
+
+    _S3_KEY_VALIDO = "uploads/12345678-1234-1234-1234-123456789abc.mp3"
+
+    @pytest.fixture
+    def mock_s3(self, monkeypatch):
+        """Mockea _S3_CLIENT con put_object_tagging + NoSuchKey class."""
+        mock = MagicMock()
+        mock.exceptions.NoSuchKey = type("NoSuchKey", (Exception,), {})
+        monkeypatch.setattr(h, "_S3_CLIENT", mock)
+        return mock
+
+    def _setup_ddb_with_consent(self, mock_ddb, training_consent, s3_key=None,
+                                 action="confirmed"):
+        """Mockea la respuesta del UpdateItem (ALL_NEW) con el item
+        post-update — incluye training_consent y s3_key (o no).
+        """
+        attrs = {
+            "feedback_status": action,
+            "feedback_timestamp": "2026-05-23T21:00:00+00:00",
+            "training_consent": training_consent,
+        }
+        if s3_key is not None:
+            attrs["s3_key"] = s3_key
+        mock_ddb.update_item.return_value = {"Attributes": attrs}
+
+    def test_consent_true_y_s3_key_dispara_put_object_tagging(
+        self, mock_ddb, mock_s3,
+    ):
+        """consent=True + s3_key presente → put_object_tagging con retain=true."""
+        self._setup_ddb_with_consent(mock_ddb, True, self._S3_KEY_VALIDO)
+
+        resp = h.handler(_feedback_event())
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["retained"] is True
+        mock_s3.put_object_tagging.assert_called_once()
+        call = mock_s3.put_object_tagging.call_args
+        assert call.kwargs["Bucket"] == h.S3_UPLOADS_BUCKET
+        assert call.kwargs["Key"] == self._S3_KEY_VALIDO
+        assert call.kwargs["Tagging"] == {
+            "TagSet": [{"Key": "retain", "Value": "true"}]
+        }
+
+    def test_consent_false_NO_dispara_put_object_tagging(
+        self, mock_ddb, mock_s3,
+    ):
+        """consent=False → NO se taguea, response retained=false."""
+        self._setup_ddb_with_consent(mock_ddb, False, self._S3_KEY_VALIDO)
+
+        resp = h.handler(_feedback_event())
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["retained"] is False
+        mock_s3.put_object_tagging.assert_not_called()
+
+    def test_consent_true_sin_s3_key_NO_dispara_tagging(
+        self, mock_ddb, mock_s3,
+    ):
+        """consent=True pero s3_key ausente (audio_b64 flow legacy): no hay
+        objeto S3 que retener; no llamamos put_object_tagging y retornamos
+        retained=false sin loguear nada (no es error)."""
+        self._setup_ddb_with_consent(mock_ddb, True, s3_key=None)
+
+        resp = h.handler(_feedback_event())
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["retained"] is False
+        mock_s3.put_object_tagging.assert_not_called()
+
+    def test_consent_true_pero_s3_no_such_key_loguea_error_y_devuelve_200(
+        self, mock_ddb, mock_s3, caplog,
+    ):
+        """El audio ya expiró (NoSuchKey). Feedback principal triunfó (DDB
+        update OK), así que devolvemos 200; pero la falla en taggear se
+        loguea a ERROR (alarmable: perdimos un audio con consent)."""
+        self._setup_ddb_with_consent(mock_ddb, True, self._S3_KEY_VALIDO)
+        mock_s3.put_object_tagging.side_effect = mock_s3.exceptions.NoSuchKey()
+
+        with caplog.at_level(logging.ERROR):
+            resp = h.handler(_feedback_event())
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["retained"] is False
+        assert any(
+            rec.levelname == "ERROR" and "no existe en bucket" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_consent_true_error_generico_s3_loguea_error_y_devuelve_200(
+        self, mock_ddb, mock_s3, caplog,
+    ):
+        """Cualquier otro error S3 (IAM, throttling, network): log ERROR,
+        retained=false, response 200 (no rompemos feedback por audit)."""
+        self._setup_ddb_with_consent(mock_ddb, True, self._S3_KEY_VALIDO)
+        mock_s3.put_object_tagging.side_effect = RuntimeError("network blip")
+
+        with caplog.at_level(logging.ERROR):
+            resp = h.handler(_feedback_event())
+
+        assert resp["statusCode"] == 200
+        body = json.loads(resp["body"])
+        assert body["retained"] is False
+        assert any(
+            rec.levelname == "ERROR" and "error generico" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+    def test_update_item_recibe_return_values_all_new(
+        self, mock_ddb, mock_s3,
+    ):
+        """El UpdateItem debe pedir ALL_NEW para poder leer training_consent
+        + s3_key del item post-update (sin GetItem extra)."""
+        self._setup_ddb_with_consent(mock_ddb, True, self._S3_KEY_VALIDO)
+
+        h.handler(_feedback_event())
+
+        call = mock_ddb.update_item.call_args
+        assert call.kwargs["ReturnValues"] == "ALL_NEW"
+        # ReturnValuesOnConditionCheckFailure debe seguir siendo ALL_OLD
+        # para no romper el path 409 (que sí necesita el item viejo).
+        assert call.kwargs["ReturnValuesOnConditionCheckFailure"] == "ALL_OLD"
 
 
 # ===========================================================================

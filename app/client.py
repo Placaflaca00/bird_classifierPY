@@ -132,7 +132,9 @@ class UploadUrlResult:
     """Resultado de POST /upload-url. Mismo patron que PredictResult.
 
     Si ``ok=True``: ``upload_url`` + ``s3_key`` + ``content_type`` listos
-    para usar (PUT a S3 + post-predict con s3_key).
+    para usar (PUT a S3 + post-predict con s3_key). ``tagging`` (Fase 5B)
+    es el string a mandar en el header ``x-amz-tagging`` del PUT; None si
+    el backend es pre-5B (retrocompat).
     Si ``ok=False``: ``error_kind`` + ``error_message`` explican que paso.
     """
 
@@ -140,6 +142,7 @@ class UploadUrlResult:
     upload_url: str | None = None
     s3_key: str | None = None
     content_type: str | None = None
+    tagging: str | None = None
     error_kind: str | None = None
     error_message: str | None = None
 
@@ -344,6 +347,7 @@ def _get_upload_url(ext: str, api_url: str | None = None) -> UploadUrlResult:
             upload_url=data["upload_url"],
             s3_key=data["s3_key"],
             content_type=data.get("content_type"),
+            tagging=data.get("tagging"),  # Fase 5B; None si backend pre-5B
         )
 
     detail = _extract_error_detail(resp)
@@ -375,11 +379,19 @@ def _get_upload_url(ext: str, api_url: str | None = None) -> UploadUrlResult:
 
 def _upload_to_s3(
     presigned_url: str, audio_bytes: bytes, content_type: str,
+    tagging: str | None = None,
 ) -> tuple[bool, str | None]:
-    """PUT bytes a S3 con presigned URL. Header Content-Type EXPLICITO.
+    """PUT bytes a S3 con presigned URL. Headers Content-Type + Tagging EXPLICITOS.
 
-    S3 valida que el Content-Type del PUT matchee el ContentType firmado en
-    el presigned. Si difiere -> 403 SignatureDoesNotMatch.
+    S3 valida que el Content-Type Y el x-amz-tagging del PUT matcheen lo
+    firmado en el presigned. Si difiere -> 403 SignatureDoesNotMatch.
+
+    Fase 5B — ``tagging`` (e.g. ``"retain=false"``): se manda como header
+    ``x-amz-tagging`` cuando el caller lo provee. El backend lo firma en el
+    presigned a partir de Fase 5B. Default ``None`` (sin header) por
+    retrocompat con presigned viejos en flight (TTL 10 min); cuando todos
+    los presigned activos sean Fase 5B el default puede dejarse como tal o
+    pasar a obligatorio.
 
     NO usa la session con retries: presigned tiene TTL 10min, si falla mejor
     pedir URL nueva que reintentar la misma.
@@ -387,11 +399,14 @@ def _upload_to_s3(
     Returns (ok, error_message). El error_message es para logging del caller,
     no se muestra directo al usuario (el caller mapea a 'upload_failed').
     """
+    headers = {"Content-Type": content_type}
+    if tagging:
+        headers["x-amz-tagging"] = tagging
     try:
         resp = requests.put(
             presigned_url,
             data=audio_bytes,
-            headers={"Content-Type": content_type},
+            headers=headers,
             timeout=S3_PUT_TIMEOUT,
         )
     except requests.exceptions.Timeout:
@@ -600,8 +615,13 @@ def predict(
         )
 
     # --- Step 3: PUT a S3 ----------------------------------------------
+    # Fase 5B — pasamos el tagging que el backend firmó en el presigned. Si
+    # el backend es pre-5B, ``upload.tagging`` es None y no mandamos header
+    # (retrocompat).
     s3_ok, s3_err = _upload_to_s3(
-        upload.upload_url, audio_bytes, upload.content_type or "application/octet-stream",
+        upload.upload_url, audio_bytes,
+        upload.content_type or "application/octet-stream",
+        tagging=upload.tagging,
     )
     if not s3_ok:
         return PredictResult(

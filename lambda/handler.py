@@ -88,6 +88,20 @@ S3_UPLOADS_BUCKET = "conocetuave-py-uploads"
 S3_UPLOADS_PREFIX = "uploads/"
 PRESIGNED_URL_EXPIRES_S = 600  # 10 min — alcanza para subir, no tanto para abusar
 
+# Fase 5B — retention via S3 object tagging. Todo objeto nuevo nace con tag
+# retain=false (firmado en el presigned URL + mandado por el cliente en el
+# header x-amz-tagging). La lifecycle rule del bucket borra a 30d SOLO los
+# objetos con retain=false. Cuando /feedback recibe un consent positivo,
+# llama PutObjectTagging cambiando a retain=true y el objeto sale del scope
+# de la rule — sobrevive indefinido para revision humana (Fase 5) + futuro
+# retraining (Fase 6).
+#
+# Por que NO usar "exclude tag" en la lifecycle rule: S3 lifecycle solo
+# soporta filtros INCLUSIVOS por tag (Filter.And.Tags), no exclusivos. Eso
+# fuerza el modelo "todos taggeados al PUT, retag para sobrevivir".
+S3_TAG_RETAIN_FALSE = "retain=false"  # tagging string para presigned + PUT header
+S3_TAG_RETAIN_TRUE = [{"Key": "retain", "Value": "true"}]  # PutObjectTagging arg
+
 # MIME types soportados. Whitelist contra inputs malformados ("exe", "../").
 # Subset estricto de validation.py:ALLOWED_FORMATS — m4a NO esta porque el
 # frontend Gradio convierte a wav del lado servidor antes de mandar (Safari
@@ -550,12 +564,18 @@ def _generate_upload_url(ext: str) -> dict:
     content_type = _CONTENT_TYPE_BY_EXT[ext]
     s3_key = f"{S3_UPLOADS_PREFIX}{uuid.uuid4()}.{ext}"
 
+    # Fase 5B — Tagging firmado en el presigned. S3 lifecycle solo borra
+    # objetos con retain=false (ver lifecycle rule en infra/). El cliente
+    # DEBE mandar el header x-amz-tagging matching, o S3 rechaza con
+    # SignatureDoesNotMatch. Si consent llega via /feedback, se retaguea a
+    # retain=true y el objeto sale del scope de la rule.
     upload_url = _S3_CLIENT.generate_presigned_url(
         ClientMethod="put_object",
         Params={
             "Bucket": S3_UPLOADS_BUCKET,
             "Key": s3_key,
             "ContentType": content_type,
+            "Tagging": S3_TAG_RETAIN_FALSE,
         },
         ExpiresIn=PRESIGNED_URL_EXPIRES_S,
         HttpMethod="PUT",
@@ -566,6 +586,7 @@ def _generate_upload_url(ext: str) -> dict:
         "s3_key": s3_key,
         "expires_in": PRESIGNED_URL_EXPIRES_S,
         "content_type": content_type,
+        "tagging": S3_TAG_RETAIN_FALSE,
     }
 
 
@@ -1292,12 +1313,17 @@ def _handle_feedback(event: dict) -> dict:
         expr_values[":cs"] = corrected_species
 
     try:
-        _DDB_TABLE.update_item(
+        # Fase 5B — ``ReturnValues=ALL_NEW`` para leer training_consent y
+        # s3_key del item post-update sin un GetItem extra. El resource API
+        # deserializa esta respuesta a tipos Python nativos (a diferencia del
+        # ALL_OLD del exception, que viene en DynamoDB-JSON crudo).
+        response = _DDB_TABLE.update_item(
             Key={"pk": f"PRED#{prediction_id}", "sk": "META"},
             UpdateExpression=update_expr,
             ConditionExpression="attribute_exists(pk) AND #fstatus = :none",
             ExpressionAttributeNames=expr_names,
             ExpressionAttributeValues=expr_values,
+            ReturnValues="ALL_NEW",
             ReturnValuesOnConditionCheckFailure="ALL_OLD",
         )
     except _DDB_TABLE.meta.client.exceptions.ConditionalCheckFailedException as e:
@@ -1347,10 +1373,82 @@ def _handle_feedback(event: dict) -> dict:
             "error": f"no se pudo registrar el feedback: {type(e).__name__}"
         })
 
-    payload = {"prediction_id": prediction_id, "feedback_status": action}
+    # --- Fase 5B: retain audio si el usuario dio training_consent --------
+    # training_consent + s3_key vienen del item PREDICTION (lo escribió
+    # _write_prediction_item al hacer /predict). Modelo conceptual: el
+    # consent se establece en /predict (cuando el audio se sube), NO en
+    # /feedback — el /feedback solo dispara el retag basado en esa
+    # decision previa.
+    #
+    # Si no hay s3_key (audio_b64 flow, no S3) no hay nada que retener.
+    # Si training_consent es False/None, dejamos el tag default retain=false
+    # y el objeto expira con la lifecycle rule de 30d.
+    #
+    # Fail-loud (no swallow): cualquier error del PutObjectTagging se loguea
+    # a ERROR. Pero NO rompe la response del feedback — la operacion
+    # principal (registrar feedback en DDB) ya triunfo, y la respuesta debe
+    # reflejar eso. ``retained`` en el payload le indica al frontend si la
+    # retencion se aplico.
+    updated_item = response.get("Attributes", {})
+    training_consent = bool(updated_item.get("training_consent", False))
+    s3_key = updated_item.get("s3_key")
+    retained = _maybe_retain_audio(prediction_id, training_consent, s3_key)
+
+    payload = {"prediction_id": prediction_id, "feedback_status": action,
+               "retained": retained}
     if action == "corrected":
         payload["feedback_corrected_species"] = corrected_species
     return _response(200, payload)
+
+
+def _maybe_retain_audio(
+    prediction_id: str, training_consent: bool, s3_key: str | None,
+) -> bool:
+    """Si consent + s3_key, retaguea el objeto S3 a retain=true. Fail-loud.
+
+    Returns:
+        True  si se aplico el tag (objeto persistira tras los 30d).
+        False si no aplica (consent=false, s3_key ausente) o si el
+              PutObjectTagging fallo. Errores se loguean a ERROR (alarmable
+              en CloudWatch); la response del /feedback queda 200 igual
+              porque la operacion principal del endpoint (registrar el
+              feedback en DDB) ya triunfo — separamos la audit trail.
+
+    Idempotency: PutObjectTagging reemplaza el tag set existente. Re-llamar
+    con retain=true sobre un objeto ya retagueado es no-op funcional, sin
+    races. (En Fase 5B no re-llamamos porque la ConditionExpression del
+    UpdateItem permite UNA sola transicion none->action, pero el reintento
+    de Lambda sobre la misma invocacion seguiria siendo seguro.)
+    """
+    if not training_consent or not s3_key:
+        return False
+    try:
+        _S3_CLIENT.put_object_tagging(
+            Bucket=S3_UPLOADS_BUCKET,
+            Key=s3_key,
+            Tagging={"TagSet": S3_TAG_RETAIN_TRUE},
+        )
+        return True
+    except _S3_CLIENT.exceptions.NoSuchKey:
+        # El objeto ya expiro o nunca se subio. No es bug, es race
+        # esperada si el feedback llega despues de los 30d de la
+        # lifecycle. Aun asi logueamos a ERROR (no a INFO) porque indica
+        # que perdimos un audio con consent — vale la pena alarmar.
+        logger.error(
+            "PutObjectTagging fallo: s3_key no existe en bucket (audio ya expirado?)",
+            extra={"prediction_id": prediction_id, "s3_key": s3_key},
+        )
+        return False
+    except Exception as e:  # noqa: BLE001
+        # Cualquier otro error S3 (IAM mal, throttling, network).
+        logger.error(
+            "PutObjectTagging fallo (error generico)",
+            extra={
+                "prediction_id": prediction_id, "s3_key": s3_key,
+                "error_type": type(e).__name__, "error_msg": str(e),
+            },
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
