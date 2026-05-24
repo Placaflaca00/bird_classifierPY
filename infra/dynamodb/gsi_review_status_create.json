@@ -1,0 +1,14 @@
+[
+  {
+    "Create": {
+      "IndexName": "by_review_status_and_time",
+      "KeySchema": [
+        {"AttributeName": "review_status", "KeyType": "HASH"},
+        {"AttributeName": "timestamp", "KeyType": "RANGE"}
+      ],
+      "Projection": {
+        "ProjectionType": "ALL"
+      }
+    }
+  }
+]

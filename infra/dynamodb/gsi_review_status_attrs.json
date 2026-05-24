@@ -1,0 +1,4 @@
+[
+  {"AttributeName": "review_status", "AttributeType": "S"},
+  {"AttributeName": "timestamp", "AttributeType": "S"}
+]

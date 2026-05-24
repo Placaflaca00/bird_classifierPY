@@ -206,3 +206,8 @@ benchmarks/*.log
 /memory/
 
 .claude/*
+# Annotator IAM access keys (NEVER commit)
+infra/annotator/access_keys.json
+
+infra/annotator/space_credentials.txt
+infra/annotator/create_space.py
