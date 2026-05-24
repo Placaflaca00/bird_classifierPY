@@ -211,3 +211,4 @@ infra/annotator/access_keys.json
 
 infra/annotator/space_credentials.txt
 infra/annotator/create_space.py
+infra/annotator/add_admin_secrets.py

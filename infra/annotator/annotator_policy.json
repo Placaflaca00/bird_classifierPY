@@ -2,10 +2,11 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "QueryGSIAndGetItems",
+      "Sid": "QueryScanAndGetItems",
       "Effect": "Allow",
       "Action": [
         "dynamodb:Query",
+        "dynamodb:Scan",
         "dynamodb:GetItem"
       ],
       "Resource": [
