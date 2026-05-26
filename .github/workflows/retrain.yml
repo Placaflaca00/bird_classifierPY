@@ -36,6 +36,15 @@ env:
   AWS_REGION: us-east-1
   PYTHON_VERSION: '3.12'
   DDB_TRAINING_RUNS_TABLE: bird-classifier-py-training-runs
+  # W&B credentials a nivel workflow: cualquier step que llame scripts/
+  # con dependencias W&B (export_dataset, evaluate descarga prod ckpt,
+  # eventualmente train/promote para upload de modelos) las hereda.
+  # Sin esto, cada step necesita declararlas en su env: y se rompe por
+  # olvido. Trade-off: jobs start/finalize tambien las ven aunque no las
+  # usen — aceptable porque corren en el mismo runner trust boundary.
+  WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+  WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
+  WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
 
 jobs:
 
@@ -118,10 +127,6 @@ jobs:
             --run-id "$RUN_ID" --action update --current-job export --status running
 
       - name: Run export_dataset.py
-        env:
-          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
-          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
-          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
         run: |
           set -euo pipefail
           FLAGS="--apply"
