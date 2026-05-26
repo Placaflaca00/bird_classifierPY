@@ -1,17 +1,15 @@
-# PLACEHOLDER del workflow Fase 6 retrain.
+# Workflow Fase 6 — retraining loop (orquesta los 4 scripts standalone de 6.3).
 #
-# El workflow REAL (6 jobs, ~310 lineas) vive en branch feature/retrain-workflow
-# durante el testing E2E. Este placeholder cumple un solo proposito: que
-# GitHub Actions UI muestre "Run workflow" en el dropdown — sin esto, no se
-# puede disparar workflow_dispatch para testear desde la feature branch.
+# Triggers:
+#   - workflow_dispatch (manual desde GH UI, util para testing en branch)
+#   - repository_dispatch (event_type=retrain, futuro UI tab Training de 6.5)
 #
-# Cuando workflow_dispatch se invoca eligiendo feature/retrain-workflow en el
-# dropdown, GH usa el contenido del archivo en ESA branch (no de main).
-# Por eso main puede tener este placeholder noop y feature branch tiene el
-# real.
+# AWS auth via OIDC (sin long-lived keys en GH Secrets). Trust policy del role
+# `bird-retrain-ci-role` scopea a refs/heads/main + refs/heads/feature/retrain-workflow.
+# Ver infra/iam/create_bird_retrain_ci_role.py.
 #
-# Cuando el workflow real pase los tests E2E, se mergea feature/retrain-workflow
-# a main, sobreescribiendo este placeholder.
+# Concurrency: 1 retrain a la vez por ref (branch). Dos clicks del boton no
+# disparan 2 workflows compitiendo por el mismo Lambda update.
 
 name: Retrain bird-classifier (Fase 6)
 
@@ -19,25 +17,476 @@ on:
   workflow_dispatch:
     inputs:
       include_seed:
-        description: 'Incluir items seed (testing E2E). Default false en prod.'
+        description: 'Incluir items seed (testing E2E)'
         type: boolean
         default: false
   repository_dispatch:
     types: [retrain]
 
-# Permissions necesarios para OIDC. Quedan declarados aqui aunque el job
-# noop no los usa, para que la feature branch herede el mismo bloque.
 permissions:
-  id-token: write
-  contents: read
+  id-token: write       # CRITICO para OIDC. Sin esto sts:AssumeRoleWithWebIdentity falla.
+  contents: read        # actions/checkout
+
+concurrency:
+  group: retrain-${{ github.ref }}
+  cancel-in-progress: false   # NUNCA matar un retrain en curso (puede dejar Lambda inconsistente)
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::863518416901:role/bird-retrain-ci-role
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.12'
+  DDB_TRAINING_RUNS_TABLE: bird-classifier-py-training-runs
 
 jobs:
-  placeholder:
-    name: 'Placeholder (real workflow en feature/retrain-workflow)'
+
+  # ---------------------------------------------------------------------------
+  # Job 1 — start: crea el item RUN# en DDB, expone run_id como output.
+  # ---------------------------------------------------------------------------
+  start:
+    name: 'Job 1: start (init DDB)'
     runs-on: ubuntu-latest
-    if: false   # NUNCA corre desde main. El real esta en la feature branch.
+    timeout-minutes: 5
+    outputs:
+      run_id: ${{ steps.gen.outputs.run_id }}
+      include_seed: ${{ steps.gen.outputs.include_seed }}
     steps:
-      - run: |
-          echo "Si estas viendo esto, el workflow real no se cargo desde la"
-          echo "feature branch. Verificar que workflow_dispatch fue invocado"
-          echo "eligiendo feature/retrain-workflow en el dropdown."
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install minimal deps for notify
+        run: pip install boto3 python-dotenv
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: gen
+        name: Generate run_id + register in DDB
+        run: |
+          set -euo pipefail
+          RUN_ID=$(python -c "import uuid; print(uuid.uuid4())")
+          # include_seed prioriza workflow_dispatch input; fallback a client_payload (repo dispatch)
+          INCLUDE_SEED="${{ inputs.include_seed || github.event.client_payload.include_seed || 'false' }}"
+          TRIGGERED_BY="${{ github.event.client_payload.triggered_by || github.actor }}"
+          TRIGGERED_VIA="${{ github.event_name }}"
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "include_seed=$INCLUDE_SEED" >> "$GITHUB_OUTPUT"
+
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action create \
+            --status running --current-job start \
+            --field "triggered_by=$TRIGGERED_BY" \
+            --field "triggered_via=$TRIGGERED_VIA" \
+            --field "github_run_id=${{ github.run_id }}" \
+            --field "github_run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --field "git_sha=${{ github.sha }}" \
+            --field "include_seed=$INCLUDE_SEED"
+
+          echo "run_id=$RUN_ID"
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — export-dataset: DDB scan approved + S3 download + embeddings.
+  # ---------------------------------------------------------------------------
+  export-dataset:
+    name: 'Job 2: export-dataset'
+    needs: start
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+      INCLUDE_SEED: ${{ needs.start.outputs.include_seed }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install project (data extras)
+        run: pip install -e ".[data]"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Notify start of export
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job export --status running
+
+      - name: Run export_dataset.py
+        env:
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          WANDB_PROJECT: ${{ secrets.WANDB_PROJECT }}
+          WANDB_ENTITY: ${{ secrets.WANDB_ENTITY }}
+        run: |
+          set -euo pipefail
+          FLAGS="--apply"
+          if [ "$INCLUDE_SEED" = "true" ]; then
+            FLAGS="$FLAGS --include-seed"
+          fi
+          python -u scripts/export_dataset.py $FLAGS
+
+      - name: Resolve dataset path + report
+        id: ds
+        run: |
+          set -euo pipefail
+          DATASET=$(ls data/processed/embeddings_retrain_*.parquet | head -1)
+          if [ -z "$DATASET" ]; then
+            echo "::error::No se genero el parquet de export."
+            exit 1
+          fi
+          echo "dataset_path=$DATASET" >> "$GITHUB_OUTPUT"
+          N_TOTAL=$(python -c "import pandas as pd; print(len(pd.read_parquet('$DATASET')))")
+          N_ANNOT=$(python -c "import pandas as pd; df=pd.read_parquet('$DATASET'); print(int((df['source']=='annotator').sum()))")
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job export \
+            --field "dataset_path=$(basename $DATASET)" \
+            --field "n_samples_total=$N_TOTAL" \
+            --field "n_samples_annotator=$N_ANNOT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dataset-${{ env.RUN_ID }}
+          path: data/processed/embeddings_retrain_*.parquet
+          retention-days: 7
+
+      - name: Notify failure (export)
+        if: failure()
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize --status failed_critical \
+            --failure-reason "export-dataset job failed (see github_run_url)"
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — train: corre 50 epochs CPU sobre el parquet.
+  # ---------------------------------------------------------------------------
+  train:
+    name: 'Job 3: train (50 epochs CPU)'
+    needs: [start, export-dataset]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60         # CPU runners GH son ~2 vCPU; margen sobre los ~30 min locales
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install project (data + dev extras)
+        run: pip install -e ".[data,dev]"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataset-${{ env.RUN_ID }}
+          path: data/processed/
+
+      - name: Notify start of train
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job train --status running
+
+      - name: Run train.py
+        run: |
+          set -euo pipefail
+          DATASET=$(ls data/processed/embeddings_retrain_*.parquet | head -1)
+          python -u scripts/train.py --dataset "$DATASET" --apply --seed 42
+
+      - name: Resolve checkpoint + metrics + notify
+        id: tr
+        run: |
+          set -euo pipefail
+          # Buscar best ckpt (cualquier run_name producto del train)
+          CKPT=$(ls checkpoints/retrain-*/best-*.ckpt 2>/dev/null | head -1)
+          RUN_NAME=$(basename "$(dirname "$CKPT")")
+          METRICS="reports/$RUN_NAME/metrics.json"
+
+          echo "ckpt_path=$CKPT" >> "$GITHUB_OUTPUT"
+          echo "metrics_path=$METRICS" >> "$GITHUB_OUTPUT"
+          echo "train_run_name=$RUN_NAME" >> "$GITHUB_OUTPUT"
+
+          # Extraer metricas clave para DDB
+          BEST_F1=$(python -c "import json; m=json.load(open('$METRICS')); print(m['best_val_macro_f1'])")
+          HARD_ACC=$(python -c "import json; m=json.load(open('$METRICS')); print(m['final_metrics']['test_hard']['test_acc'])")
+          HARD_F1=$(python -c "import json; m=json.load(open('$METRICS')); print(m['final_metrics']['test_hard']['test_macro_f1'])")
+          SHA=$(python -c "import json; m=json.load(open('$METRICS')); print(m['state_dict_sha256'])")
+
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job train \
+            --field "best_ckpt_path=$CKPT" \
+            --field "train_run_name=$RUN_NAME" \
+            --field "best_val_macro_f1=$BEST_F1" \
+            --field "hard_acc=$HARD_ACC" \
+            --field "hard_macro_f1=$HARD_F1" \
+            --field "state_dict_sha256=$SHA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ env.RUN_ID }}
+          path: |
+            checkpoints/retrain-*/best-*.ckpt
+            reports/retrain-*/metrics.json
+            reports/retrain-*/confmat_*.png
+          retention-days: 14
+
+      - name: Notify failure (train)
+        if: failure()
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize --status failed_critical \
+            --failure-reason "train job failed (see github_run_url)"
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — evaluate: McNemar mid-p vs prod, decide should_promote.
+  # ---------------------------------------------------------------------------
+  evaluate:
+    name: 'Job 4: evaluate (McNemar vs prod)'
+    needs: [start, export-dataset, train]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+    outputs:
+      should_promote: ${{ steps.ev.outputs.should_promote }}
+      train_run_name: ${{ steps.ev.outputs.train_run_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install project (data + dev extras)
+        run: pip install -e ".[data,dev]"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataset-${{ env.RUN_ID }}
+          path: data/processed/
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-${{ env.RUN_ID }}
+          path: .
+
+      - name: Notify start of evaluate
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job evaluate --status running
+
+      - name: Run evaluate.py
+        id: ev
+        run: |
+          set -euo pipefail
+          CKPT=$(ls checkpoints/retrain-*/best-*.ckpt | head -1)
+          RUN_NAME=$(basename "$(dirname "$CKPT")")
+          DATASET=$(ls data/processed/embeddings_retrain_*.parquet | head -1)
+          # NOTA: prod-ckpt es checkpoints/wa-drop3-v1/best-*.ckpt. NO viene
+          # del artifact (es del repo, commiteado). Verificar que existe.
+          if ! ls checkpoints/wa-drop3-v1/best-*.ckpt >/dev/null 2>&1; then
+            echo "::error::Falta prod-ckpt checkpoints/wa-drop3-v1/best-*.ckpt en el repo."
+            exit 1
+          fi
+          python -u scripts/evaluate.py \
+            --candidate-ckpt "$CKPT" \
+            --dataset "$DATASET" \
+            --apply
+
+          # Extraer should_promote para outputs del job
+          EVAL_JSON="reports/$RUN_NAME/evaluation_vs_prod.json"
+          SHOULD_PROMOTE=$(python -c "import json; print(str(json.load(open('$EVAL_JSON'))['should_promote']).lower())")
+          DELTA_ACC=$(python -c "import json; m=json.load(open('$EVAL_JSON')); print(m['delta_test_hard']['acc_pp'])")
+          DELTA_F1=$(python -c "import json; m=json.load(open('$EVAL_JSON')); print(m['delta_test_hard']['macro_f1_pp'])")
+          P_VALUE=$(python -c "import json; m=json.load(open('$EVAL_JSON')); print(m['mcnemar']['p_value'])")
+          REASON=$(python -c "import json; print(json.load(open('$EVAL_JSON'))['reason'])")
+
+          echo "should_promote=$SHOULD_PROMOTE" >> "$GITHUB_OUTPUT"
+          echo "train_run_name=$RUN_NAME" >> "$GITHUB_OUTPUT"
+
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job evaluate \
+            --field "should_promote=$SHOULD_PROMOTE" \
+            --field "delta_acc_pp=$DELTA_ACC" \
+            --field "delta_macro_f1_pp=$DELTA_F1" \
+            --field "mcnemar_p_value=$P_VALUE" \
+            --field "evaluation_reason=$REASON"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-${{ env.RUN_ID }}
+          path: reports/retrain-*/evaluation_vs_prod.json
+          retention-days: 30
+
+      - name: Notify failure (evaluate)
+        if: failure()
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize --status failed_critical \
+            --failure-reason "evaluate job failed (see github_run_url)"
+
+  # ---------------------------------------------------------------------------
+  # Job 5 — promote: gateado por GH Environment "production" (required reviewer).
+  # Solo corre si evaluate decidio should_promote=true. La approval es el
+  # human-in-loop (admin lee reporte de evaluate antes de aprobar el deploy).
+  # ---------------------------------------------------------------------------
+  promote:
+    name: 'Job 5: promote (Lambda update + smoke)'
+    needs: [start, export-dataset, train, evaluate]
+    if: needs.evaluate.outputs.should_promote == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production       # SETUP MANUAL: GH Settings -> Environments -> production
+                                  # - Required reviewer: Placaflaca00
+                                  # - Wait timer: 1 min (lectura de reporte evaluate)
+                                  # - Deployment branches: main + feature/retrain-workflow
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+      TRAIN_RUN_NAME: ${{ needs.evaluate.outputs.train_run_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install project
+        run: pip install -e ".[data,dev]"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Restore artifacts producidos por jobs anteriores
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataset-${{ env.RUN_ID }}
+          path: data/processed/
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-${{ env.RUN_ID }}
+          path: .
+      - uses: actions/download-artifact@v4
+        with:
+          name: evaluation-${{ env.RUN_ID }}
+          path: .
+
+      # Docker layer cache (scope=retrain para no conflictuar con otros workflows
+      # si en el futuro se agregan). v7 requerido porque GH Cache API v1 fue
+      # shutdown 2025-04-15.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      # NOTA: el build esta dentro de promote.py, no como step independiente,
+      # porque promote.py override temporal lambda/models/classifier.onnx con el
+      # candidato + restore post-build. No podemos usar docker/build-push-action
+      # @v7 directamente porque el script gestiona override. Pero igual seteamos
+      # buildx por si promote.py lo encuentra ya configurado.
+
+      - name: Notify start of promote
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job promote --status running
+
+      - name: Run promote.py --apply-deploy
+        run: |
+          set -euo pipefail
+          EVAL_JSON=$(ls reports/retrain-*/evaluation_vs_prod.json | head -1)
+          python -u scripts/promote.py --evaluation "$EVAL_JSON" --apply-deploy
+
+      - name: Notify success of promote
+        run: |
+          set -euo pipefail
+          PROMOTION_JSON=$(ls reports/retrain-*/promotion_result.json | head -1)
+          ECR_URI=$(python -c "import json; print(json.load(open('$PROMOTION_JSON'))['image_uri'])")
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job promote \
+            --field "promoted=true" \
+            --field "ecr_image_uri=$ECR_URI" \
+            --field "smoke_test_passed=true"
+
+      - name: Notify failure (promote)
+        if: failure()
+        run: |
+          # promote.py ya hace auto-rollback en smoke fail. Aqui solo
+          # registramos el estado y disparamos status=failed_critical para
+          # que la UI muestre banner.
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job promote \
+            --field "promoted=false" \
+            --field "rollback_triggered=true"
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize --status failed_critical \
+            --failure-reason "promote job failed; rollback should have triggered automatically (see promote.py logs in github_run_url)"
+
+  # ---------------------------------------------------------------------------
+  # Job 6 — finalize: SIEMPRE corre. Deriva status terminal del estado de
+  # los jobs anteriores y escribe a DDB. Cubre cases skipped + cancelled.
+  # ---------------------------------------------------------------------------
+  finalize:
+    name: 'Job 6: finalize (status terminal)'
+    needs: [start, export-dataset, train, evaluate, promote]
+    if: always()                  # crucial: incluso si jobs anteriores fallaron
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - run: pip install boto3 python-dotenv
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Derive terminal status
+        id: derive
+        env:
+          R_EXPORT: ${{ needs.export-dataset.result }}
+          R_TRAIN: ${{ needs.train.result }}
+          R_EVAL: ${{ needs.evaluate.result }}
+          R_PROMOTE: ${{ needs.promote.result }}
+          SHOULD_PROMOTE: ${{ needs.evaluate.outputs.should_promote }}
+        run: |
+          python <<'EOF' >> $GITHUB_OUTPUT
+          import os
+          r = {
+              "export": os.environ.get("R_EXPORT", "?"),
+              "train": os.environ.get("R_TRAIN", "?"),
+              "evaluate": os.environ.get("R_EVAL", "?"),
+              "promote": os.environ.get("R_PROMOTE", "?"),
+          }
+          should_promote = os.environ.get("SHOULD_PROMOTE", "false") == "true"
+
+          # Decision tree:
+          # promote success -> promoted
+          # promote failure -> failed (handler ya escribio failed_critical, pero finalize gana)
+          # promote skipped + should_promote=true -> rejected (approval denied/cancelled)
+          # promote skipped + should_promote=false -> succeeded (comportamiento esperado)
+          # algun job anterior failed -> failed
+          if r["promote"] == "success":
+              status = "promoted"
+          elif r["promote"] == "failure":
+              status = "failed"
+          elif r["evaluate"] == "success":
+              status = "rejected" if should_promote else "succeeded"
+          else:
+              # alguno de export/train/evaluate fallo
+              status = "failed"
+          print(f"final_status={status}")
+          EOF
+
+      - name: Finalize DDB item
+        env:
+          FINAL_STATUS: ${{ steps.derive.outputs.final_status }}
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize --status "$FINAL_STATUS"
