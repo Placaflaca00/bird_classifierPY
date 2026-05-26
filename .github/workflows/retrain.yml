@@ -1,0 +1,43 @@
+# PLACEHOLDER del workflow Fase 6 retrain.
+#
+# El workflow REAL (6 jobs, ~310 lineas) vive en branch feature/retrain-workflow
+# durante el testing E2E. Este placeholder cumple un solo proposito: que
+# GitHub Actions UI muestre "Run workflow" en el dropdown — sin esto, no se
+# puede disparar workflow_dispatch para testear desde la feature branch.
+#
+# Cuando workflow_dispatch se invoca eligiendo feature/retrain-workflow en el
+# dropdown, GH usa el contenido del archivo en ESA branch (no de main).
+# Por eso main puede tener este placeholder noop y feature branch tiene el
+# real.
+#
+# Cuando el workflow real pase los tests E2E, se mergea feature/retrain-workflow
+# a main, sobreescribiendo este placeholder.
+
+name: Retrain bird-classifier (Fase 6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_seed:
+        description: 'Incluir items seed (testing E2E). Default false en prod.'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [retrain]
+
+# Permissions necesarios para OIDC. Quedan declarados aqui aunque el job
+# noop no los usa, para que la feature branch herede el mismo bloque.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  placeholder:
+    name: 'Placeholder (real workflow en feature/retrain-workflow)'
+    runs-on: ubuntu-latest
+    if: false   # NUNCA corre desde main. El real esta en la feature branch.
+    steps:
+      - run: |
+          echo "Si estas viendo esto, el workflow real no se cargo desde la"
+          echo "feature branch. Verificar que workflow_dispatch fue invocado"
+          echo "eligiendo feature/retrain-workflow en el dropdown."
