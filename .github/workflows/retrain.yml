@@ -104,7 +104,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       - name: Install project (data extras)
-        run: pip install -e ".[data]"
+        run: |
+          pip install -e ".[data]"
+          pip install -r requirements-ci.txt
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -176,7 +178,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       - name: Install project (data + dev extras)
-        run: pip install -e ".[data,dev]"
+        run: |
+          pip install -e ".[data,dev]"
+          pip install -r requirements-ci.txt
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -261,7 +265,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       - name: Install project (data + dev extras)
-        run: pip install -e ".[data,dev]"
+        run: |
+          pip install -e ".[data,dev]"
+          pip install -r requirements-ci.txt
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -356,7 +362,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
       - name: Install project
-        run: pip install -e ".[data,dev]"
+        run: |
+          pip install -e ".[data,dev]"
+          pip install -r requirements-ci.txt
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
