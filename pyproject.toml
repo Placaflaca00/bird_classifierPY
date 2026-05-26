@@ -44,6 +44,10 @@ data = [
     "python-dotenv>=1.0",
     "pandera>=0.20",
     "audiomentations>=0.36",
+    # AWS SDK requerido por scripts/notify_training_run.py + export_dataset.py
+    # + generate_seed_data.py + promote.py + infra/. Pertenece a `data` extras
+    # porque el data pipeline integra con S3 + DynamoDB.
+    "boto3>=1.34",
 ]
 
 [project.urls]
