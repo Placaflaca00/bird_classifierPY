@@ -1,0 +1,96 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DynamoDBPredictionItemsRead",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:GetItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-data",
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-data/index/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDBTrainingRunsReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-training-runs",
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-training-runs/index/*"
+      ]
+    },
+    {
+      "Sid": "S3AudiosRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::conocetuave-py-uploads",
+        "arn:aws:s3:::conocetuave-py-uploads/*"
+      ]
+    },
+    {
+      "Sid": "ECRAuthGlobal",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ECRRepositoryPushPull",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:DescribeImages"
+      ],
+      "Resource": "arn:aws:ecr:us-east-1:863518416901:repository/bird-classifier-py"
+    },
+    {
+      "Sid": "LambdaDeployAndInvoke",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:UpdateFunctionCode",
+        "lambda:InvokeFunction"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:863518416901:function:bird-classifier-py-inference"
+    },
+    {
+      "Sid": "DenyDestructive",
+      "Effect": "Deny",
+      "Action": [
+        "iam:*",
+        "dynamodb:DeleteTable",
+        "dynamodb:UpdateTable",
+        "dynamodb:DeleteItem",
+        "s3:DeleteBucket",
+        "s3:PutLifecycleConfiguration",
+        "s3:DeleteObject",
+        "lambda:DeleteFunction",
+        "lambda:DeleteFunctionConcurrency",
+        "ecr:DeleteRepository",
+        "ecr:BatchDeleteImage"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
