@@ -39,7 +39,7 @@ Cada decisión vive en su propio archivo `D<N>_<slug>.md` (e.g. `D01_birdnet_emb
 - [ ] D17 — Python 3.11 (vs 3.10 / 3.12).
 - [ ] D18 — Estrategia de splits (train/val/test estratificado por especie).
 - [ ] D19 — Métrica primaria: macro-F1 (vs accuracy / weighted-F1).
-- [ ] D20 — Política de tests de regresión sobre set fijo en `data/test_sets/`.
+- [x] [D20 — Política de hold-out inmutable versionado en W&B Artifacts](D20_holdout_immutable.md).
 - [ ] D21 — Política de versionado de modelos (semver del modelo en S3).
 - [ ] D22 — Setup AWS manual (vs IaC con Terraform/CDK desde el día 1).
 - [ ] D23 — Sin VPC para la Lambda (latencia vs aislamiento).

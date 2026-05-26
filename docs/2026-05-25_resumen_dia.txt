@@ -1,0 +1,202 @@
+================================================================================
+RESUMEN DEL DIA — 2026-05-25
+Sub-fases 6.0 → 6.3 ejecutadas completas. Pipeline Fase 6 listo punta-a-punta.
+================================================================================
+
+
+6.0 — RETRAINING_STRATEGY.txt (FSDL 7 etapas + epilogo)
+-------------------------------------------------------
+- Documento estrategico cubriendo SISTEMA ENTERO end-to-end, no solo retraining
+- Etapa 1: Planning / Project Setup — 20 especies, audiencia zoos/ONGs PY,
+  metrica primaria test_hard, restricciones (free tier, CPU only, 1 persona)
+- Etapa 2: Data Collection & Labeling — XC + WikiAves + GBIF descartado,
+  folder=label sin labeling pago, version W&B Artifacts
+- Etapa 3: Data Exploration & Preprocessing — NO pre-procesamiento (decision
+  contra-intuitiva justificada), pre-computar embeddings, splits stratified,
+  experimentos negativos documentados (waveform-aug-k2, mixup, class weights)
+- Etapa 4: Modeling & Training — MLP 1024->256->128->20, ~300K params,
+  AdamW + ReduceLROnPlateau, seleccion por val_macro_f1, CPU only,
+  baseline-v0 -> wa-drop3-v1 (mejora vino de DATA, no de modelo)
+- Etapa 5: Evaluation & Error Analysis — test_clean + test_hard separados,
+  3 scripts standalone, cache per-window, McNemar, benchmark +24/+42pp vs
+  BirdNET nativo, find_label_issues sin cleanlab
+- Etapa 6: Deployment & Serving — Lambda Docker + HTTP API + S3 presigned +
+  DDB single-table, cold start engineering Fase 5A, pipeline anti-troll 4
+  capas, IAM least-privilege con tests reales
+- Etapa 7: Monitoring & Continual Learning — DDB single source of truth,
+  dashboard admin Fase 5, drift detection ausente documentado honestamente,
+  feedback loop user (debil) + ornitologo (experto)
+- Epilogo: 8 decisiones transversales (data > model, eval=prod,
+  human-in-loop deliberado, scope cerrado, defense-in-depth sin paranoia)
+
+
+6.1 — D20: Politica hold-out inmutable (formal ADR)
+----------------------------------------------------
+- Archivo: docs/decisions/D20_holdout_immutable.md
+- Hold-out = test_clean (351) + test_hard (208) = 559 samples sobre 20 clases
+- Politica: NUNCA mutar :v0; si hay que cambiar -> :v1 nuevo
+- Splits y test_hard versionados en W&B Artifacts con lineage
+- 5 alternativas descartadas (mutable, parcial, snapshot por modelo,
+  DVC, S3 manual)
+- Contrato con Fase 6: McNemar pareado require MISMO hold-out, sino la
+  comparacion es invalida
+- Verificado contra metadata real: 208 audios xc_hard = las 20 especies
+  finales (el comentario "21 especies" del script es historico pre-drop)
+
+
+6.2 — Seed data generator (scripts/generate_seed_data.py)
+----------------------------------------------------------
+- 387 lineas, ~100 items review_status=approved fake en DDB
+- Decisiones: S3 real (no filesystem), fake top1 coherente (YAGNI vs
+  modelo real), dual marker (is_seed_data en DDB + prefix uploads/seed/
+  en S3)
+- Reproducibilidad: --random-seed default 42
+- Idempotencia: --apply aborta si ya hay seed items, --append bypass
+- Estado live: 100 items balanced 5/especie en las 20, 70 easy + 30
+  hard, 63.7 MB en S3
+- WARNING activo: tabla DDB y bucket compartidos prod+test -> queries
+  del dashboard y export DEBEN filtrar is_seed_data != True
+- Bug fix encontrado en execucion: las creds AWS viven en
+  ~/.aws/credentials (no en .env). Cambie guard de env var a
+  boto3.Session().get_credentials() — funciona para multiples
+  mecanismos (env, shared file, IAM role)
+- Hallazgo: 3 items DDB approved con reviewed_label=None (deuda tecnica
+  no bloqueante, mi filtro is_in(20) los descarta)
+
+
+6.3 — Scripts standalone E2E validados
+---------------------------------------
+
+scripts/export_dataset.py (~520 lineas)
+- Lee DDB approved + descarga audios de S3 + calcula embeddings BirdNET
+- Re-generacion FULL cada run (no append) — sincronizado con DDB siempre
+- Cache SHA-256 por audio para evitar recompute de los 2590 originales
+- Fail-loud si s3_key falta (con prediction_id en mensaje)
+- Output: parquet self-contained con audit columns (source, ddb_pk,
+  generated_at, git_sha)
+- Bug encontrado y arreglado: mix float64 (originales) + float32 (nuevos)
+  rompia pyarrow -> normalize todo a float32 antes de escribir
+- Resultado: 2691 filas (2590 original + 101 annotator), cache 100% HIT
+  en re-run, 11.1 MB output
+
+scripts/train.py (~400 lineas)
+- Standalone, reusa BirdClassifier de src/models/classifier.py
+- Hyperparams hardcoded a defaults wa-drop3-v1 (aisla efecto del dataset
+  como variable confounding — no McNemar)
+- Determinismo robusto: torch.use_deterministic + cuDNN flags + CUBLAS
+- Sanity checks pre-train: D20 invariant (cero annotator en hold-out),
+  shape 1024, sin NaN, warn especies <10
+- Run naming: retrain-<ts>-<git_sha[:7]>
+- Resultado smoke (2 epochs): pipeline E2E OK
+- Resultado full (50 epochs, best epoch=22): val_macro_f1=0.909,
+  hard_acc=0.8173, hard_macro_f1=0.7929
+
+tests/test_train_equivalence.py (~150 lineas)
+- Garantiza scripts/train.py y src/training/train.py producen ckpts
+  identicos sobre mismo subset + misma seed
+- Bug REAL detectado por el test al primer run: scripts/train.py pasaba
+  generator=g local al DataLoader, legacy usa global RNG -> divergencia
+  legacy macro_f1=0.084 vs new=0.217. Fix: quitar generator local.
+- Tolerancia atol=1e-4 (logica core, no determinismo extra)
+- Lesson learned ORO para CV: el test atrapo bug semantico que un code
+  review humano facilmente no atrapa
+
+scripts/evaluate.py (~470 lineas)
+- McNemar mid-p (Fagerland et al. 2013, citado en docstring) —
+  superior a Edwards CC + binomial exacto
+- Edge case b+c==0: predicciones identicas -> p=1.0, no promover
+- Bootstrap CI 1000 resamples sobre pares pareados — segunda senal
+  independiente de McNemar
+- Macro F1 floor (-0.5pp) — anti regresion sigilosa en clases minoritarias
+- Ejecutado contra candidato actual:
+    delta_acc_pp = +0.48 (< 1.0 threshold)
+    p_value McNemar = 0.7905 (>> 0.05)
+    delta_macro_f1_pp = -1.31 (< -0.5 floor)
+    bootstrap CI delta_acc_pp = [-2.40, +3.85] cruza cero
+- should_promote = FALSE con 3 razones independientes
+- Esto demuestra que el threshold funciona como GATE REAL, no
+  rubber-stamp. El sistema NO se auto-promueve por ruido.
+
+scripts/promote.py (~700 lineas) — 4 etapas con risk creciente
+- Etapa 1 (sin AWS): ONNX export disciplinado (model.eval() critico,
+  do_constant_folding, onnx.checker) + skew check pareado (delta_acc <
+  0.5pp Y disagreement_rate < 1%)
+- Etapa 2 (sin AWS push): docker build con cwd=lambda/ + override
+  temporal de lambda/models/classifier.{onnx,json} + restaurar repo
+- Etapa 3: ECR login + push + update-function-code apuntando al digest
+  (no tag) + poll hasta Active
+- Etapa 4: smoke test con baseline persistido (5 audios fijos del
+  dataset) + auto-rollback si falla
+- Naming flag: --bypass-promotion-gate (explicito anti-accidente) +
+  env guard si BIRD_CLASSIFIER_ENV=prod
+- Decision documentada: NO migrar a Lambda aliases (volumen 1-2
+  users/dia, audiencia sin SLA, costo de complejidad > beneficio).
+  Decision revisable si emergen requirements de SLA.
+- Contrato train-serving skew documentado: evaluate.py decide con
+  .ckpt limpio, promote.py debe re-verificar ONNX antes de deploy
+- Bugs encontrados y resueltos en execucion:
+    * UnicodeEncodeError emojis ✅ de torch.onnx en cp1252 Windows ->
+      sys.stdout.reconfigure(encoding="utf-8") pre-import torch
+    * Build context wrong: Dockerfile asume cwd=lambda/, no raiz
+    * ONNX external data (classifier.onnx.data) por default del nuevo
+      dynamo exporter -> re-save inline para paridad con prod
+    * Sidecar JSON sin idx_to_species rompia _load_classifier del
+      handler
+    * Smoke parser buscaba top1_species/top3, response real es
+      {"predictions": [...]}
+
+scripts/smoke_baseline.json
+- 5 audios fijos del dataset: chauna, ramphastos, columba, jabiru, rhea
+- Predicciones esperadas (top1 + confidence) generadas con wa-drop3-v1
+  (modelo en prod ACTUAL) — NO con el candidato
+- Sirve como referencia de comportamiento que el nuevo modelo debe
+  preservar dentro de tolerancia (top1 >= 80%, conf +-15pp, p95 < 2s)
+
+
+VALIDACION E2E DEL PROMOTE PIPELINE
+-----------------------------------
+Ejecutado con --apply-deploy --bypass-promotion-gate contra el
+candidato retrain-20260525T184324-6b77788 que sabemos que NO mejora.
+Pipeline ejecuto las 4 etapas:
+
+- Etapa 1: skew check PERFECT (0.00pp delta, 0.00% disagreement). El
+  ONNX exportado es bit-perfect en argmax vs el .ckpt sobre las 208
+  muestras de test_hard.
+- Etapa 2: Docker build OK. Imagen local 1.69 GB.
+- Etapa 3: ECR push + Lambda update + Active en 21s. Lambda PROD
+  apunto al nuevo digest.
+- Etapa 4 smoke: FAIL DETECTADO (4/5 top1 correctos, 1 audio rejected
+  por capa anti-troll del candidato, 1 confidence drift de +29pp).
+- AUTO-ROLLBACK exitoso en 21s. Lambda volvio a fase5b-retention
+  (wa-drop3-v1) sin intervencion manual. Cero impacto en usuarios.
+
+Lecciones del E2E (oro para CV):
+- El pipeline funciona EXACTAMENTE como diseno: detecta drift legitimo
+  y protege produccion automaticamente.
+- Auto-rollback en 21s sin intervencion humana — patron MLOps maduro.
+- El "fail del smoke" es FEATURE, no bug: el sistema rechazo un
+  candidato divergente al baseline. Si fuera modelo roto real, ese
+  comportamiento habria salvado prod.
+- Estado final: Lambda en prod = wa-drop3-v1 (igual que al iniciar),
+  candidato disponible en ECR (no en uso), repo limpio.
+
+
+ESTADO ACTUAL DEL SISTEMA
+-------------------------
+- Lambda bird-classifier-py-inference: fase5b-retention (wa-drop3-v1) en
+  prod, running normal
+- ECR: tag retrain-20260525T184324-6b77788 existe (no usado)
+- DDB bird-classifier-py-data: 100 items seed + 4 items reales (1 Jabiru
+  approved valido + 3 con reviewed_label=None, deuda tecnica)
+- S3 conocetuave-py-uploads/uploads/seed/: 100 audios (63.7 MB,
+  tagged retain=true&seed_data=true)
+- Repo: limpio, ningun override pendiente. models/ y lambda/models/
+  intactos
+- Workflow GH Actions: NO existe aun (sub-fase 6.4)
+- UI tab Training: NO existe aun (sub-fase 6.5)
+
+
+SUB-FASE 6.3: CERRADA
+PROXIMO: 6.4 — GitHub Actions workflow + IAM bird-retrain-ci +
+tabla DDB training_runs (3 piezas fusionadas porque son
+interdependientes)

@@ -1,0 +1,1447 @@
+================================================================================
+RETRAINING_STRATEGY.txt — Estrategia del proyecto bird-classifier-py
+Draft de bullets siguiendo las 7 etapas del Full Stack Deep Learning (FSDL).
+Cada bullet es punto de partida para amplificar en el doc final (Word).
+Iniciado: 2026-05-25
+================================================================================
+
+
+================================================================================
+ETAPA 1 — Planning / Project Setup
+================================================================================
+
+OBJETIVO DEL PRODUCTO
+- Clasificar especies de aves de Paraguay a partir de un clip de audio corto.
+- Por que Paraguay especificamente: nicho geografico definido, manejable en
+  scope, alineado con audiencia objetivo (zoos/ONGs locales). Un modelo
+  "todas las aves del mundo" seria intratable como proyecto de portfolio.
+
+AUDIENCIA / STAKEHOLDERS
+- Zoologicos y ONGs de conservacion de Paraguay.
+- Modelo de distribucion: donacion gratuita, no producto comercial.
+- Implicancia tecnica clave: sin SLA enterprise, sin multi-region, sin alta
+  concurrencia. Esto justifica usar Lambda serverless ($0 cuando nadie lo usa)
+  en vez de instancias dedicadas.
+- Implicancia de scope clave: terminar y demostrar end-to-end > optimizar
+  metricas indefinidamente.
+
+COBERTURA DEL MODELO: 20 ESPECIES
+- Empezamos con 23 candidatas, terminamos con 20.
+- Drop de 3 especies (Eudromia formosa, Phoenicopterus chilensis,
+  Mycteria americana): tenian <20 audios cada una, ensuciaban entrenamiento
+  sin valor real de cobertura.
+- Rescate de 3 via WikiAves (Pipile/Aburria jacutinga, Jabiru mycteria,
+  Rhea americana): inicialmente tambien tenian poca data, pero scrapeamos
+  WikiAves para llegar a un piso aceptable.
+- Alternativa descartada: mantener las 23 originales. La iteracion inicial
+  mostro que las 3 con <20 audios degradaban el modelo en las otras 20 por
+  desbalance.
+
+METRICA PRIMARIA: ACCURACY EN test_hard
+- Hold-out de audios curados de Xeno-Canto, condiciones de campo dificiles
+  (ruido, distancia, viento, otras especies de fondo).
+- Modelo actual en produccion (wa-drop3-v1): 0.8125 hard accuracy / 0.8060
+  hard F1.
+- Por que hard y no clean: Fase 3 demostro empiricamente que ganar en
+  test_clean y perder en test_hard es trivial (un run con waveform
+  augmentation lo hizo). El dominio real de uso es grabaciones de campo, no
+  audios limpios de XC con estudio.
+- Metrica secundaria: macro F1 (penaliza desbalance entre clases, importante
+  con 20 especies de tamano desigual).
+- Metrica operacional: latencia inference warm < 1.5s end-to-end (medido:
+  1.15s P50 a traves del API Gateway).
+
+RESTRICCIONES DEL PROYECTO
+- Costo: AWS free tier + serverless. Lambda Docker ($0 cold-time), DynamoDB
+  on-demand, S3 lifecycle a 30d, sin RDS ni EC2 dedicado. Budget mensual
+  real medido < $5.
+- Compute training: CPU only. Habilita CI gratuito en GitHub Actions (repo
+  publico, ilimitado). Esto solo es viable porque el modelo es chico (MLP
+  head ~300K params), no por restriccion real de GPU.
+- Datos: ~10-200 audios por especie, fuentes publicas (Xeno-Canto +
+  WikiAves). No tenemos labeling humano a escala.
+- Equipo: 1 persona. Esto justifica simplicidad operacional sobre
+  ingenieria sofisticada (sin Kubernetes, sin Airflow, sin feature store
+  dedicado).
+
+DECISION ARQUITECTONICA RAIZ: PIPELINE TWO-STAGE
+- Stage 1: BirdNET V2.4 TFLite (pre-entrenado, frozen) -> embedding 1024-dim.
+- Stage 2: MLP supervisado 1024 -> 256 -> 128 -> 20, entrenado desde scratch.
+- Por que two-stage en vez de fine-tunear BirdNET directamente:
+    * BirdNET fue entrenado sobre miles de especies globalmente. Tiene
+      representacion rica que no queres perder.
+    * Fine-tunear toda la red con nuestros ~2000 audios totales causaria
+      overfitting catastrofico.
+    * Entrenar solo el head es 10000x mas barato y produce mejores resultados
+      en dominio chico (verificado en benchmark: +24pp clean / +42pp hard
+      top-1 vs BirdNET native).
+- Alternativa descartada: fine-tunear BirdNET. Se verifico como techo
+  arquitectonico. No movio la aguja sobre el head MLP entrenado.
+
+NO METAS (SCOPE CERRADO, IMPORTANTE PARA CV INTERVIEW)
+- No deteccion temporal en grabacion larga (input es clip pre-recortado por
+  el usuario).
+- No clasificacion multi-label (asumimos 1 clip = 1 especie principal).
+- No especies fuera de las 20 elegidas (sistema reporta "Otros" si confianza
+  baja, no intenta clasificarlas).
+- No real-time streaming (input es upload de archivo, batch de 1).
+
+
+================================================================================
+ETAPA 2 — Data Collection & Labeling
+================================================================================
+
+FUENTES INVESTIGADAS Y ELEGIDAS
+- Xeno-Canto (xeno-canto.org): fuente principal inicial. Comunidad global de
+  grabaciones de aves, ~800k audios, metadata curada por usuarios (especie,
+  pais, rating de calidad A-E).
+  * Acceso: API v2 funcionaba sin key (ya no, ahora v3 requiere registro).
+  * Por que elegida: cobertura geografica de PY razonable, metadata de
+    especie ya labeled por la comunidad, audio en formato MP3 estandar.
+  * Limitacion: algunas especies de PY tienen <20 grabaciones. Triggers el
+    rescate via WikiAves.
+
+- WikiAves (wikiaves.com.br): plataforma brasilena de avistamiento de aves.
+  * Por que elegida: tiene cobertura fuerte de aves del Cono Sur que pisan
+    Paraguay. Cuando una especie tiene <20 audios en XC, WikiAves
+    frecuentemente tiene 50+.
+  * Como integrada: scraping (no API publica oficial). Scripts
+    analyze_wikiaves.py + download_wikiaves.py.
+  * Gotcha tecnico clave (lo amplificas en doc): URL del CDN incluye un
+    fragmento # que rompe `requests` por default. Hubo que parsear y
+    re-armar la URL antes del download. Headers User-Agent requeridos
+    porque rechaza requests vacios.
+  * Cobertura medida: ~2x el dataset si bajamos todo lo disponible para las
+    20 especies.
+
+- GBIF (gbif.org): investigada como alternativa agregadora.
+  * Que es: agrega XC + Macaulay Library + iNaturalist en un solo endpoint
+    /occurrence/search, sin autenticacion.
+  * Por que NO se uso: metadata inconsistente entre fuentes (mismo audio
+    puede tener distintos labels), y al final XC + WikiAves alcanzaban.
+  * Mencionarla en doc demuestra que se evaluaron alternativas, no que
+    "no se busco mas". Diferencia clave en CV interview.
+
+- Macaulay Library (Cornell): no usada standalone. Mencionada via GBIF.
+
+LABELING STRATEGY: FOLDER NAME = LABEL
+- Decision: el nombre de la carpeta bajo data/raw/ es el label canonico.
+  Ejemplo: data/raw/rhea_americana/ -> todos los MP3 dentro son Rhea
+  americana.
+- Conversion: snake_case en filesystem -> "Genus species" en metadata
+  (rhea_americana -> "Rhea americana").
+- Por que NO usar metadata externa de XC/WikiAves como source of truth:
+  * Inconsistencias entre fuentes (taxonomia distinta, sinonimos).
+  * Acoplamiento debil con scripts de descarga (si cambia formato XC, no
+    rompe pipeline downstream).
+  * Single source of truth = filesystem. Simple, auditable, version-
+    controlable conceptualmente.
+- Limitacion conocida: label noise. La comunidad de XC/WikiAves no es
+  infalible. Algunos audios estan mal-labeled.
+  * Mitigacion: cleanup manual de label noise en Fase 5 (find_label_issues.py
+    detecta candidatos sospechosos via discrepancia entre prediccion BirdNET
+    y label declarado).
+
+LO QUE NO HACEMOS: LABELING HUMANO PAGO
+- Alternativa descartada: contratar labelers via Scale AI, Mechanical Turk,
+  o similar.
+- Por que descartada:
+  * Costo prohibitivo para budget del proyecto (donacion gratuita).
+  * Especies de PY no son priority para labelers genericos sin training
+    ornitologico.
+  * Confianza en curacion comunitaria de XC/WikiAves es suficiente para
+    20 especies bien definidas.
+- Alternativa diferida (no descartada): crowdsourcing in-app. Los propios
+  usuarios suben audios via app y un experto ornitologo (Fase 5 annotator)
+  los confirma. Es el loop que Fase 6 va a cerrar.
+
+PIPELINE DE DESCARGA Y PROCESAMIENTO
+- Convencion del proyecto: scripts CLI con dry-run-by-default + flag
+  --apply para destructivo. Esto previene descargas masivas accidentales.
+- Scripts principales:
+  * scripts/analyze_raw_audio.py: scan de MP3s. Detecta silenciosos
+    (ffmpeg silencedetect) y corruptos (ffprobe falla). Reporta y opcional
+    elimina con --delete.
+  * scripts/download_wikiaves.py: scraping WikiAves con throttling y retry.
+  * scripts/download_xc_test_hard.py: descarga curada de XC para hold-out
+    test_hard, filtrando por rating de calidad bajo (C/D) para audios
+    dificiles.
+  * scripts/build_metadata.py: consolida data/raw/ -> data/raw/
+    metadata.parquet. Idempotente.
+- Gotcha de plataforma (Windows-specifico): subprocess.run contra ffmpeg
+  con text=True crashea porque stderr de ffmpeg contiene metadata MP3
+  (artista, titulo en encoding raro) que rompe el decode cp1252. Solucion:
+  capturar bytes y decodificar con errors="replace".
+
+SCHEMA DE metadata.parquet
+- Columnas core: filepath (relativo a data/raw/), species ("Genus species"),
+  folder_name (snake_case), source (xc | wikiaves | ...), duration_s,
+  sample_rate, file_size_bytes, source_id (id original en XC/WikiAves).
+- Formato Parquet vs CSV:
+  * Parquet preserva tipos (float, int, string) sin parsing ambiguo.
+  * Lectura columnar mas rapida cuando solo necesitas algunas columnas.
+  * Compresion built-in (~3-5x mejor que CSV gzipped).
+  * Trade-off: no editable a mano en text editor. Para este proyecto OK
+    porque el pipeline regenera el archivo.
+
+VOLUMEN Y DISTRIBUCION
+- Total post-WikiAves rescate: ~3500 audios distribuidos en 20 especies.
+- Range por especie: 10 (pisos bajos) a 200+ (especies abundantes en XC
+  como Vanellus chilensis).
+- Desbalance: ratio max/min ~20:1. Importante para Etapa 4 (decision de
+  class weighting / balanced sampling) y Etapa 5 (uso de macro F1 en vez
+  de accuracy puro como metrica secundaria).
+
+QUALITY ISSUES CONOCIDOS (NO RESUELTOS, GESTIONADOS)
+- Sample rates varian de 8 kHz a 192 kHz. No pre-resampleamos: BirdNET
+  resamplea internamente a 48 kHz. Pre-procesar agregaria complejidad sin
+  beneficio.
+- Mezcla de calidades: grabaciones de estudio profesional + grabaciones de
+  campo con mobile phone. Esto es feature, no bug: el modelo tiene que
+  funcionar en condiciones de campo reales del usuario final.
+- Algunos clips muy cortos (<1s) o muy largos (>5 min). BirdNET procesa en
+  ventanas de 3s, asi que clips cortos pueden tener 1 ventana sola y largos
+  se promedian. No se filtran a priori para preservar volumen de data.
+
+VERSIONADO DE DATOS: W&B ARTIFACTS COMO SOURCE OF TRUTH
+- Decision: los datasets versionados viven en Weights & Biases (W&B)
+  Artifacts, no en filesystem local.
+- Tres artifacts separados (no un blob unico):
+  * raw_audios:vN -> los MP3s en si.
+  * metadata:vN -> el metadata.parquet.
+  * splits:vN -> el split train/val/test asignado a cada audio.
+- Por que separados:
+  * metadata cambia mas frecuentemente que audio (re-curacion, fix de
+    typos en species). Bumpear solo metadata sin re-subir audios.
+  * splits se actualizan cuando se decide cambiar estrategia (estratificado
+    por especie, k-fold, etc.) sin tocar el dataset base.
+  * Permite "linage" en W&B: model:v5 -> entrenado sobre embeddings:v3 ->
+    embeddings:v3 viene de raw_audios:v2 + metadata:v4 + splits:v1.
+- Local data/raw/ es working copy. Se puede borrar y re-sincronizar desde
+  W&B. Esta gitignored.
+
+CONSTRUCCION DEL HOLD-OUT (test_clean + test_hard) — DECISION CRITICA
+- El hold-out total son DOS folds, NO uno solo:
+  * test_clean (351 audios): split aleatorio estratificado por especie con
+    seed=42, derivado del dataset principal. Mide performance en
+    distribucion de training.
+  * test_hard (208 audios): dataset SEPARADO de Xeno-Canto, filtrado por
+    rating D/E (peor calidad, ruido alto, condiciones de campo). Mide
+    performance en dominio real.
+- Por que dos hold-outs y no uno:
+  * Solo test_clean (split estandar) sobre-estima performance en uso real
+    (mismas grabaciones limpias de XC studio).
+  * Solo test_hard sub-estima performance (rating D/E es el peor 20% de
+    XC, no representa todo el dominio).
+  * Reportar ambos por separado permite diagnosticar overfit a estudio
+    (clean alto + hard bajo) vs underfit general (ambos bajos).
+- Cobertura: ambos folds tienen las 20 especies finales del clasificador
+  wa-drop3-v1.
+- POLITICA DE INMUTABILIDAD: ambos folds son sagrados. NUNCA modificar
+  `:v0`. Si hay que cambiar (audio mal-labeled critico, cambio de scope,
+  cambio de feature extractor), bumpear `:v1` nuevo con razon documentada.
+  Modelos viejos retienen su metrica historica sobre `:v0`; modelos
+  nuevos se evaluan sobre `:v1`. Si se quiere comparar cross-version, se
+  re-evalua el modelo viejo sobre `:v1` antes del McNemar.
+- POLITICA FORMALIZADA EN ADR: ver `docs/decisions/D20_holdout_immutable.md`
+  para procedimiento de bump, alternativas descartadas, y notas
+  operacionales (sub-fase 6.1 ejecutada 2026-05-25).
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Pensamiento explicito sobre fuentes (no agarrar la primera, evaluar
+  alternativas).
+- Distincion entre datos de training vs hold-out (no es lo mismo, no se
+  mezclan).
+- Manejo pragmatico de label noise (mitigacion, no eliminacion).
+- Versionado de datos (W&B Artifacts) — practica de MLOps madura.
+- Decisiones costo/beneficio (no pagar labeling, no GBIF aunque "tendria
+  mas data").
+
+
+================================================================================
+ETAPA 3 — Data Exploration & Preprocessing
+================================================================================
+
+EDA INICIAL (LO QUE SE EXPLORO ANTES DE MODELAR)
+- Distribucion de duracion de audios: range muy amplio, desde <1s hasta
+  >5min. La mediana esta en torno a 10-30s. Conclusion: no filtrar por
+  duracion, BirdNET maneja clips de cualquier largo (ventaneo interno).
+- Distribucion de sample rates: 8 kHz a 192 kHz. La mayoria en 44.1 kHz o
+  48 kHz (estandar de XC). Conclusion: no resamplear nosotros, BirdNET
+  resamplea internamente a 48 kHz.
+- Distribucion de samples por especie: desbalance fuerte (ratio max/min
+  ~20:1). Algunas especies como Vanellus chilensis tienen 200+ audios,
+  otras como las rescatadas (Pipile, Jabiru, Rhea) apenas 30-50 post-
+  rescate WikiAves.
+- Deteccion de archivos corruptos/silenciosos: scripts/analyze_raw_audio.py
+  usa ffprobe + ffmpeg silencedetect para flaggear MP3s problematicos.
+  ~2-5% del dataset se eliminaba en cada iteracion de scraping.
+
+DECISION DE PREPROCESSING: NO HACER NINGUNO
+- Decision contra-intuitiva pero importante de explicar en CV interview:
+  NO pre-procesamos el audio antes de pasarlo a BirdNET.
+- Por que:
+  * BirdNET fue entrenado con audio raw (con sus propias asunciones de
+    resampling, ventaneo, normalizacion).
+  * Cualquier pre-processing nuestro (resampling, denoising, normalizacion
+    de loudness) introduce un mismatch entre training de BirdNET y nuestro
+    inference. Resultado: embeddings peores.
+  * Lo confirmamos empiricamente en Fase 4: pre-resamplear a 16 kHz antes
+    de pasar a BirdNET degrado la performance del clasificador downstream.
+- Alternativa explorada y descartada como preprocessing fijo: VAD (Voice
+  Activity Detection) con umbral -2.0 dB para recortar silencios.
+  * Resultado: mejora hard accuracy +5pp pero rompe clean accuracy.
+  * Decision: NO incluir como preprocessing del training. Quedo registrado
+    como tecnica eval-time aplicable, pero el train-time se queda raw.
+- Alternativa explorada y descartada: bandpass filter (cortar frecuencias
+  fuera de 500 Hz - 12 kHz, range tipico de cantos de aves).
+  * Resultado: degrada todas las metricas. BirdNET aparentemente usa
+    informacion fuera de ese range (resonancias del background, etc.).
+  * Decision: descartado completamente.
+
+CHANGE OF REPRESENTATION: AUDIO -> EMBEDDING (Y POR QUE PRE-COMPUTAR)
+- Decision arquitectonica clave: en vez de calcular embedding BirdNET en
+  cada epoch durante entrenamiento, pre-computamos una sola vez sobre todo
+  el dataset.
+- Pipeline resultante:
+    data/raw/<species>/*.mp3
+      -> scripts/precompute_embeddings.py
+      -> data/processed/embeddings.npy (shape: N x 1024)
+      -> data/processed/labels.npy (shape: N,)
+- Por que pre-computar:
+  * BirdNET en CPU procesa ~10 audios/seg. Con ~3500 audios y 50 epochs
+    de training -> 175000 inferencias -> 5 horas solo en feature
+    extraction.
+  * Pre-computando: una vez son ~6 minutos, despues cada epoch corre en
+    ~30 segundos solo sobre el MLP head.
+  * Trade-off aceptado: NO podemos hacer data augmentation que modifique
+    el waveform (time stretch, pitch shift, noise injection). El embedding
+    ya esta congelado.
+- Como se extrae el embedding 1024-dim (detalle no obvio):
+  * BirdNET V2.4 TFLite tiene una ultima capa de clasificacion sobre ~6000
+    especies. NO queremos esa salida (no incluye especies de PY).
+  * Usamos el output de la PENULTIMA capa (embedding 1024-dim) leyendo el
+    interpreter con experimental_preserve_all_tensors=True.
+  * El indice del tensor: embedding_idx = classifier_out_idx - 1.
+  * Documentacion vieja de BirdNET (V1.x / V2.1) menciona 320-dim. NO
+    aplica a V2.4. Verificado empiricamente.
+
+SPLITS TRAIN / VAL / TEST: STRATIFIED, NO ALEATORIO
+- Decision: split stratificado por especie, no aleatorio puro.
+- Ratio tipico: 80% train / 10% val / 10% test_clean (interno del dataset
+  principal). test_hard es separado, ver Etapa 2.
+- Por que stratified:
+  * Con desbalance 20:1 y ~30 audios en la especie minoritaria, un random
+    split deja 3 audios para val + 3 para test. Demasiado ruido en
+    metricas.
+  * Stratified garantiza distribucion proporcional en cada split.
+- Implementacion: scripts/build_splits.py asigna una columna `fold` con
+  valores train/val/test al metadata.parquet. Resultado vive como
+  data/processed/splits.parquet.
+- Versionado: splits:v0 en W&B Artifact, con lineage hacia embeddings:v0.
+  Politica: para garantizar comparabilidad cross-experimento, nadie
+  modifica splits:v0. Si hay que cambiar, splits:v1 + nuevo baseline.
+
+SANITY CHECKS DE LOS SPLITS (DEFENSA BARATA)
+- Cobertura: cada split tiene >=1 sample por cada una de las 20 especies.
+  Si fallara -> error explicito en build_splits.py, no fallback silencioso.
+- No leakage: el mismo audio_id no aparece en mas de un split. Verificado
+  via assert en build_splits.py.
+- Distribucion de duracion: similar entre splits. Si test tuviera audios
+  sistematicamente mas cortos o mas largos, las metricas serian
+  enganosas.
+
+EXPERIMENTOS DE DATA AUGMENTATION (FASE 3 — CONTENIDO RICO PARA CV)
+- Contexto: como el embedding esta pre-computado, augmentation debe operar
+  sobre el embedding o agregarse antes de pre-computar (recomputando
+  embeddings post-aug). Probamos varios approaches.
+
+- Experimento: waveform-aug-k2 (time stretch + pitch shift suave)
+  * Setup: regenerar embeddings sobre audios augmentados (k=2 copias por
+    audio), entrenar sobre dataset duplicado.
+  * Resultado: +1pp accuracy en test_clean, -2pp en test_hard.
+  * Interpretacion: el augmentation introduce variabilidad que ayuda a
+    distinguir especies similares en condiciones limpias, pero degrada
+    la representacion para audios ya difíciles.
+  * Decision: DESCARTADO. El test_hard es la metrica que importa para
+    dominio real (ver Etapa 1).
+
+- Experimento: mixup (combinacion lineal de pares de samples + sus labels)
+  * Setup: x' = lambda * x_i + (1-lambda) * x_j, label = misma combinacion.
+  * Resultado: degrada todas las metricas.
+  * Interpretacion: mixup tiene sentido en problemas con manifold continuo
+    (imagenes naturales). Para audio de especies discretas, mezclar dos
+    embeddings produce un punto que no representa ninguna especie real.
+  * Decision: DESCARTADO temprano.
+
+- Experimento: class weighting (loss penaliza errores en clases
+  minoritarias)
+  * Setup: weight inversamente proporcional a frecuencia de clase en train.
+  * Resultado: mejora marginal en macro F1 (~+0.5pp), pero baja accuracy
+    global. Variante classw-no-eudromia (22 clases pre-drop) bajo hard F1.
+  * Decision: NO incluido en modelo final. La mejora en macro F1 no
+    justifico la complejidad ni la regression en otras metricas.
+
+- Experimento: aug agresiva (iter2 de Fase 5)
+  * Setup: aumentacion mas fuerte (noise + multiple time stretches +
+    spectral aug si tuvieramos acceso al mel).
+  * Resultado: degrada test_clean significativamente.
+  * Decision: DESCARTADO. Techo de mejora aparente con este enfoque.
+
+NORMALIZACION
+- Embeddings BirdNET ya vienen aproximadamente normalizados (output de
+  capa interna pre-clasificacion). No aplicamos normalizacion adicional
+  (z-score, L2) porque empeoraba metricas en pilots.
+- Labels: integer encoding (0..19) sobre las 20 especies, mapeo
+  consistente via scripts/build_metadata.py. La correspondencia
+  label_id -> "Genus species" vive en un JSON sidecar para inference.
+
+MANEJO DEL DESBALANCE: METRICA DE SELECCION
+- Decision pragmatica: en vez de fixear el desbalance con weighting o
+  oversampling, usamos macro F1 como metrica de seleccion de modelos.
+- Por que: macro F1 promedia F1 entre clases sin ponderar por frecuencia.
+  Una mejora en macro F1 quiere decir que el modelo balanceo entre clases,
+  no que mejoro solo en las clases abundantes.
+- Resultado practico: los hiperparametros elegidos son los que maximizan
+  macro F1 en val, no accuracy. Esto sesga hacia balance entre especies.
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Decisiones empiricas (no "lo que dice el paper"): pre-procesamiento
+  descartado porque empeora, augmentation descartado porque rompe metrica
+  primaria.
+- Trade-offs explicitos (pre-computar embeddings vs hacer augmentation).
+- Multiple experimentos negativos documentados (no esconderlos). Mas
+  honesto y mas demostrativo de proceso que solo mostrar lo que funciono.
+- Distincion fina entre tecnicas train-time vs eval-time (VAD).
+- Sanity checks de splits (defensa barata, demuestra disciplina
+  operacional).
+
+
+================================================================================
+ETAPA 4 — Modeling & Training
+================================================================================
+
+FRAMEWORK CHOICES Y POR QUE
+- PyTorch Lightning como framework de training (no PyTorch puro, no
+  Keras/TF).
+  * Por que Lightning: separa cleanly el codigo de "que hace el modelo"
+    (LightningModule) del "como entrenar" (Trainer, callbacks). Reduce
+    boilerplate ~70% vs PyTorch puro sin perder control.
+  * Por que NO Keras/TensorFlow: BirdNET ya es TFLite, mezclar dos
+    frameworks en un mismo repo duplica deps y complica deployment.
+    Mantener PyTorch puro para el head + TFLite para BirdNET es el unico
+    cross-framework boundary.
+  * Por que NO PyTorch puro: con un proyecto chico, el boilerplate de
+    Lightning paga la abstraccion. En proyectos custom de research donde
+    necesitas control fino, Lightning estorba. Aca no.
+- torchmetrics para metricas (no implementacion manual).
+  * MulticlassAccuracy(average="micro") -> accuracy global.
+  * MulticlassF1Score(average="macro") -> F1 promediado entre clases sin
+    ponderar por frecuencia (sensible al desbalance).
+  * Por que torchmetrics: implementaciones probadas, soporta logging
+    automatico por epoch en Lightning sin acumular manualmente.
+- Weights & Biases (W&B) como experiment tracker.
+  * Por que W&B: gratis para uso personal, integracion nativa con
+    Lightning via WandbLogger, soporta Artifacts versionados (datasets +
+    modelos con lineage). Equivalentes: MLflow (mas DIY), TensorBoard
+    (solo metrics, sin artifacts).
+- CSVLogger como modo local fallback.
+  * Cualquier dev puede correr `python -m src.training.train --local` y
+    obtener metricas en CSV sin necesitar API key W&B. Importante para
+    onboarding y CI.
+
+ARQUITECTURA: MLP HEAD 1024 -> 256 -> 128 -> num_classes
+- Implementacion exacta (src/models/classifier.py):
+    Linear(1024 -> 256) -> ReLU -> Dropout(0.3)
+    Linear(256  -> 128) -> ReLU -> Dropout(0.3)
+    Linear(128  -> num_classes)
+- Total parametros: ~300K. Cabe holgadamente en CPU, entrenable en
+  minutos.
+- Por que 2 hidden layers, no mas ni menos:
+  * 0 hidden layers (logreg directo): es el baseline-v0. Funciona pero
+    tope de capacidad. Mejora ~10pp pasando a MLP.
+  * 1 hidden layer: probado, sub-optimo vs 2.
+  * 3+ hidden layers: overfittea con ~2800 ejemplos de train. Mas
+    parametros sin mas data = ruido aprendido.
+- Por que dimensiones 256 -> 128 (compresion progresiva):
+  * Estandar de funnel: cada capa reduce a la mitad. Hipotesis: el
+    embedding 1024-dim tiene info redundante, comprimir progresivamente
+    fuerza al modelo a aprender abstraccion util en cada nivel.
+  * Alternativas testeadas: 512->256, 256->256 (sin compresion), 128->64.
+    256->128 dio mejor val_macro_f1.
+- Dropout 0.3: balance entre regularizacion y capacidad. Probado 0.0,
+  0.2, 0.5. El sweet spot fue 0.3.
+- Sin BatchNorm: el embedding ya viene normalizado por BirdNET (output
+  de capa intermedia ya en escala razonable). BatchNorm extra empeoraba.
+- Sin attention/transformer: el embedding es un vector denso 1024-dim
+  ya enriquecido. No hay estructura secuencial que justifique
+  attention. KISS.
+
+OPTIMIZER + SCHEDULER
+- Optimizer: AdamW.
+  * Por que AdamW vs Adam: AdamW separa correctamente el weight decay
+    del gradient (Adam clasico aplica weight decay como L2 sobre el
+    gradient, que interactua mal con momentum). AdamW es default
+    moderno.
+  * lr = 1e-3 (default Adam, razonable para MLPs chicos).
+  * weight_decay = 1e-4 (regularizacion L2 suave).
+- Scheduler: ReduceLROnPlateau.
+  * Setup: mode=min sobre val_loss, factor=0.5, patience=3.
+  * Comportamiento: si val_loss no mejora por 3 epochs, baja lr a la
+    mitad. Permite convergencia fina sin overshooting.
+  * Alternativa descartada: CosineAnnealing. Asume budget fijo de
+    epochs, no es robusto con early stopping.
+
+LOSS Y MANEJO OPCIONAL DEL DESBALANCE
+- Loss: CrossEntropyLoss sobre logits directos (sin softmax explicito,
+  PyTorch lo incluye internamente con log-sum-exp estable).
+- Class weights OPCIONALES, solo aplicados en TRAIN:
+  * Si `use_class_weights=True`: w_c = N / (C * n_c) estilo
+    sklearn-balanced.
+  * Critico: NO se aplican a val_loss/test_loss. Si pesaras la val_loss,
+    las metricas dejan de ser comparables entre runs con distinto
+    desbalance.
+  * En produccion (wa-drop3-v1): use_class_weights=False. Probaron con
+    weights, mejora marginal de macro_f1 pero degrada accuracy.
+- Mixup opcional sobre embeddings (lam ~ Beta(alpha, alpha)). Default
+  alpha=0 (apagado). Probado en Fase 3, no aporto.
+
+HIPERPARAMETROS DEFAULT (DESDE src/training/train.py)
+- batch_size = 64. Sweet spot entre velocidad (batches mas grandes
+  saturan CPU) y noise de gradient (batches chicos ayudan a generalizar).
+- max_epochs = 50 (tope). En practica early stopping para a ~25-35.
+- early_stopping_patience = 8 epochs sobre val_macro_f1.
+- seed = 42. Reproducibilidad.
+- deterministic=True en Lightning Trainer. Garantiza mismos resultados
+  bit-a-bit en CPU (no en GPU, ahi hay non-determinism residual).
+
+CRITERIO DE SELECCION DE CHECKPOINT
+- Decision clave: el "best model" se selecciona por val_macro_f1, NO
+  por val_loss ni val_acc.
+  * Por que: macro_f1 es la metrica primaria del proyecto (alineada con
+    desbalance, ver Etapa 3).
+  * val_loss puede mejorar mientras macro_f1 empeora si el modelo se
+    vuelve sobre-confiado en clases mayoritarias. Selecionar por loss
+    daria modelos con accuracy alta pero performance pesima en especies
+    rescatadas.
+- ModelCheckpoint setup: monitor=val_macro_f1, mode=max, save_top_k=1.
+  Tambien guarda save_last para debugging.
+- EarlyStopping setup: monitor=val_macro_f1, mode=max, patience=8.
+  Misma metrica que checkpoint -> coherencia entre "cuando parar" y
+  "que checkpoint elegir".
+
+ENTRENAMIENTO EN CPU, NO GPU
+- accelerator="cpu" explicito en Trainer.
+- Por que CPU es viable aca:
+  * Modelo chico (~300K params).
+  * Embeddings pre-computados (no se recalcula BirdNET en cada batch).
+  * Dataset chico (~3500 audios -> ~2800 ejemplos train).
+  * Tiempo por epoch: ~30 segundos. 30-50 epochs -> 15-25 minutos
+    total.
+- Implicancia para CI/CD: GitHub Actions ofrece runners CPU gratis para
+  repos publicos. Esto es lo que habilita Fase 6 (retraining automatico
+  en GH Actions). Si necesitaramos GPU, Fase 6 cambiaria radicalmente
+  (SageMaker, Vertex, costo).
+
+ENTORNO DE EJECUCION: GOOGLE COLAB (DURANTE FASE 1-5)
+- Los notebooks (notebooks/01..05) corren en Colab.
+- Patron del notebook:
+    1. !git clone <repo>
+    2. !pip install -e .
+    3. from src.training.train import train
+    4. train(config_overrides)
+- Por que Colab y no local:
+  * Velocidad cuando se queria probar con GPU (k80/T4 gratis).
+  * Convencion del workflow original: data scientist itera en notebook.
+  * Pero la logica del modelo + training vive en src/, NO en celdas del
+    notebook. Notebook = orchestrador, no implementacion.
+- Decision arquitectonica explicita en CLAUDE.md: "Keep heavy logic in
+  src/, not in notebook cells." Asegura que cualquier cosa entrenable
+  en Colab tambien lo sea en CI (GH Actions).
+
+EXPERIMENT TRACKING + LINEAGE EN W&B
+- Cada run: hyperparams completos en config + metricas por epoch +
+  metricas finales en summary + confusion matrix.
+- Lineage explicito: ANTES de fit, el WandbLogger declara
+  use_artifact("embeddings:v0") y use_artifact("splits:v0"). Esto
+  registra en W&B que ese run depende exactamente de esa version del
+  dataset.
+- Resultado: en W&B se ve un grafo completo:
+    raw_audios:v2 -> embeddings:v3 -> splits:v0 -> model:v5 (wa-drop3-v1)
+- Por que importa para CV: demostrar capacidad de reproducir cualquier
+  experimento. Cuando un entrenador no puede reproducir un resultado
+  porque "se me perdio el split" es senal de inmadurez. W&B lineage es
+  la solucion estandar.
+
+PROGRESION DE BASELINES (HISTORIA DEL PROYECTO)
+- baseline-v0: logreg directo sobre embedding 1024-dim, 23 clases.
+  Tope de capacidad arquitectonica. Hard acc ~0.74.
+- baseline MLP: el MLP 1024->256->128->23 sin augmentation, 23 clases.
+  Hard acc ~0.78.
+- aug experiments (waveform-aug-k2, mixup, class weights): ninguno
+  superio el baseline MLP en hard acc. Documentados en Etapa 3.
+- wa-drop3-v1 (Fase 5, MODELO ACTUAL EN PRODUCCION): MLP con
+  drop_species de 3 especies + rescate WikiAves, 20 clases. Hard acc
+  0.8125 / hard macro_f1 0.8060.
+- Lectura: la mejora de 0.78 -> 0.81 vino de DATA QUALITY (drop+rescate),
+  no de cambios al modelo. Lesson learned: cuando agotas margen de
+  modelo, mueve a data.
+
+EXPORT A PRODUCCION: ONNX
+- Notebook 05_export_onnx.ipynb hace la conversion final.
+- Salida: models/classifier.onnx (~1.2 MB) + models/classifier.json
+  (sidecar con label_to_id mapping + metadata version).
+- Por que ONNX y no PyTorch checkpoint:
+  * ONNX Runtime es ~3-5x mas rapido para inference en CPU vs PyTorch.
+    Critico para latencia Lambda.
+  * Sin dependencia de PyTorch en runtime (Lambda no necesita instalar
+    torch, ahorra ~700 MB de imagen Docker).
+  * Format estandar, portable a otros runtimes (ONNX Runtime, TensorRT,
+    OpenVINO).
+- Trade-off: cualquier custom op de PyTorch que no este en ONNX spec
+  falla la exportacion. El MLP basico no tiene ese problema.
+- Verificacion post-export: comparar predicciones del ONNX vs PyTorch
+  sobre los mismos inputs (deberia ser bit-identico hasta epsilon
+  numerico).
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Framework choices justificadas con trade-offs (no "porque me gusta
+  Lightning").
+- Arquitectura defendida empiricamente (probado N capas, N dimensiones).
+- Optimizer/scheduler con razon (AdamW > Adam, ReduceLROnPlateau >
+  Cosine).
+- Criterio de seleccion de checkpoint alineado con metrica primaria
+  (val_macro_f1, no val_loss).
+- Lineage de datos via W&B (reproducibilidad).
+- Distincion train-time vs eval-time (class weights solo en train).
+- Decision pragmatica de CPU sobre GPU (cuando NO necesitas GPU, no
+  uses GPU).
+- Export ONNX con justificacion operacional (latencia, deployment).
+- Lesson learned reportado honestamente (margen vino de data, no de
+  modelo). Esta clase de honestidad opera muy bien en interview.
+
+
+================================================================================
+ETAPA 5 — Evaluation & Error Analysis
+================================================================================
+
+FILOSOFIA DE EVALUACION
+- Dos test sets distintos, evaluados separados (no promediados):
+  * test_clean: split aleatorio dentro del dataset principal. Mide
+    performance en distribucion de training.
+  * test_hard: dataset SEPARADO curado de XC con rating C/D. Mide
+    performance en condiciones de campo dificiles (dominio real).
+- Por que reportar ambos separados:
+  * test_clean alto + test_hard bajo = overfit a estudio de grabacion.
+    El modelo NO funciona en uso real.
+  * Promediarlos esconderia este diagnostico.
+- Metrica primaria: macro_f1 sobre test_hard. Es la cifra que entra al
+  CV interview como "performance del sistema".
+
+METRICAS REPORTADAS POR CADA EVAL RUN
+- Accuracy global (top-1 correctness).
+- Macro F1 (promedio de F1 por clase sin ponderar por frecuencia).
+- Por que no micro F1: en problema multi-class con un solo label, micro
+  F1 == accuracy. No aporta info nueva. Macro F1 SI aporta porque
+  penaliza desbalance.
+- Top-3 accuracy: util cuando el caso de uso permite mostrar lista
+  ranked. Reportado pero no metrica primaria.
+- Per-species F1: array de 20 valores. Mostrar el min/max identifica
+  cuales especies funcionan bien y cuales no.
+
+CONFUSION MATRICES (W&B + LOCAL)
+- Loggeadas automaticamente al fin de cada run (src/training/train.py).
+- En W&B: wandb.plot.confusion_matrix interactivo.
+- Local: PNG en checkpoints/<run>/confmat_<fold>.png.
+- Lectura: identificar pares (true=A, pred=B) frecuentes. Si "Rhea
+  americana" se confunde sistematicamente con "Eudromia formosa", eso
+  guia decisiones de data (mas audios) o de modelo (feature distintivo).
+
+FRAMEWORK LOCAL DE EVAL: 3 SCRIPTS STANDALONE
+- Decision arquitectonica: los scripts de eval son SEPARADOS del
+  training. Permiten responder preguntas sin re-entrenar el modelo.
+- Reuso clave: el modulo `lambda/handler.py` se importa via importlib.
+  Garantiza que el eval usa el MISMO codigo de inferencia que
+  produccion. Sin esto, podes tener "drift" entre lo que pasa en eval
+  y en Lambda.
+
+- scripts/eval_confidence.py
+  * Pregunta: que tan seguro esta el modelo, y esa seguridad esta
+    calibrada?
+  * Output: max softmax + proba de clase verdadera por (especie, fold).
+  * Diagnostico clave: especies con poca data (rescate WikiAves)
+    tienen confianza promedio BAJA aunque accuracy aceptable. Senal de
+    "el modelo acierta por suerte, no por conviccion".
+  * Salida: CSV + boxplot PNG.
+
+- scripts/eval_cleaning.py
+  * Pregunta: pre-procesar el audio antes de inferir mejora metricas?
+  * Estrategias probadas:
+    - raw (baseline, sin pre-procesar).
+    - bandpass: butterworth 1-8 kHz (scipy.signal.butter, sosfiltfilt).
+    - vad@thr: descarta ventanas con max(BirdNET classifier) < thr.
+    - both@thr: bandpass + vad.
+  * Resultado: VAD @ thr=-2.0 dB mejora hard accuracy +5pp. Bandpass
+    degrada todo. Both no aporta sobre VAD solo.
+  * Decision: VAD se queda como tecnica EVAL-TIME, no train-time. El
+    modelo en produccion (Lambda) no aplica VAD por default (degradaria
+    el patron de inference uniforme). Pero el eval framework lo soporta
+    para auditar.
+  * Optimizacion clave: cache PER-WINDOW. Una fila por (filepath, source,
+    window_idx). Asi se barren multiples thresholds VAD sin re-pasar
+    BirdNET (que es ~1-2 seg/audio en CPU). El cache permite sweep de
+    [0.005, 0.01, 0.03, 0.05, 0.10] en segundos. ~10724 filas
+    pre-computadas.
+
+- scripts/eval_grouped.py
+  * Pregunta: el modelo confunde las "raras" (especies con poca data)
+    entre si, o las confunde con no-raras?
+  * Tres modos sobre el mismo test set:
+    - as-is: 23 clases, metricas normales.
+    - group: especies en OTHERS se agrupan a UNA clase virtual "Otros"
+      (en truth Y pred). Metricas sobre 18 clases efectivas. Equivale a
+      "el modelo no sabe cual exactamente, pero acerto al grupo".
+    - drop: samples cuya verdad esta en OTHERS se eliminan. Metricas
+      sobre las 17 clases reales sin las "raras" del eval.
+  * Resultado: confirmo la hipotesis. Las raras se confunden mas entre
+    si (group > as-is) que con no-raras (drop similar a as-is). Esto
+    JUSTIFICO el rescate WikiAves de Fase 5: mas data en las raras
+    deberia mejorarlas sin tocar las no-raras.
+
+ERROR ANALYSIS DIMENSIONS
+- Por especie: per-species F1 + per-species confusion. Identifica
+  underperformers.
+- Por confianza: histograma de max softmax separado por
+  correct/incorrect. Si los errores tienen alta confianza, el modelo
+  esta "convencidamente equivocado" -> peor que estar inseguro.
+- Por duracion de audio: clips muy cortos (<3s, una sola ventana
+  BirdNET) vs clips largos (>30s, varias ventanas promediadas). Si los
+  cortos fallan mas, el problema es de muestreo, no de modelo.
+- Por sample rate / source: audios de fuente X performean distinto que
+  de fuente Y? Senal de domain shift.
+
+DETECCION DE LABEL NOISE: scripts/find_label_issues.py
+- Approach simple, sin cleanlab:
+  * test_clean y test_hard nunca se usan para training -> las probas
+    sobre esos folds son out-of-sample naturalmente. No hace falta
+    cross-validation.
+- Score de severity (mayor = mas sospechoso):
+    severity = max_prob * (1 - true_class_prob)   si correct=False
+             = 0                                   si correct=True
+- Interpretacion: severity alto significa "el modelo esta MUY seguro de
+  otra clase Y casi descarto la clase de la etiqueta". Eso huele a
+  label noise (audio mal-etiquetado, mala calidad, ave no audible).
+- Output: top-N candidatos sospechosos por fold -> revisar manualmente
+  -> decision de fix label, dropear, o aceptar.
+- Por que NO usar cleanlab: cleanlab es lib mas pesada con
+  cross-validation. Para este caso de uso (samples explicitamente
+  out-of-sample) el approach simple alcanza. YAGNI.
+- Aplicacion real: Fase 5 (iteracion del modelo) identifico ~5-10
+  candidatos por fold, revision manual encontro 3-4 reales de label
+  noise. Fueron corregidos antes del train final de wa-drop3-v1.
+
+BENCHMARK CONTRA BIRDNET NATIVO (CONTENIDO FUERTE PARA CV)
+- Script: scripts/benchmark_baseline_vs_finetuned.py.
+- Pregunta clave: la arquitectura two-stage (BirdNET embedding + MLP
+  head supervisado) realmente aporta sobre BirdNET nativo?
+- Setup:
+  * Baseline: BirdNET V2.4 nativo (~6522 clases). Por ventana, sigmoid
+    sobre logits, max-pool per-class across windows, filtro bird-only
+    (excluye Engine/Noise/Dog/Human/ranas), top-1 mapeado a las 20
+    especies cuando hay correspondencia taxonomica.
+  * Pipeline (mio): BirdNET embedding 1024-dim (penultima capa,
+    mean-pool across windows) -> ONNX classifier 20-clases -> softmax
+    -> top-1.
+- Optimizacion: single forward por ventana captura embedding Y logits
+  nativos simultaneamente. No se procesa el audio dos veces.
+- Resultados:
+  * Top-1 accuracy clean: pipeline +24pp vs BirdNET nativo.
+  * Top-1 accuracy hard:  pipeline +42pp vs BirdNET nativo.
+  * Macro F1 hard:        pipeline +53pp vs BirdNET nativo.
+  * Gana en 20/20 especies.
+- Detalle de honestidad: Pipile jacutinga (1 de las 20) NO existe en
+  BirdNET nativo (~6522). Se reporta tabla "all 20" Y vista
+  "BirdNET-compatible 19" para auditabilidad. No se esconde la ventaja
+  estructural.
+- Decision de escala de confianza: baseline (sigmoid multi-label) y
+  pipeline (softmax single-label) NO son la misma escala. Se reportan
+  separadas; no se reporta "improvement en confianza". Esa clase de
+  cuidado es lo que distingue eval riguroso de eval cosmetico.
+- Por que importa este benchmark en CV interview:
+  * Defiende la arquitectura. "Por que no usar BirdNET directo?" tiene
+    respuesta empirica: 42pp peor en dominio real.
+  * Justifica esfuerzo del proyecto. Sin esto, alguien podria pensar
+    que el trabajo es trivial.
+  * Demuestra rigor: aislas la contribucion del head supervisado
+    controlando todo lo demas.
+
+COMPARACION DE MODELOS (PROMOCION EN FASE 6): McNEMAR'S TEST
+- Pregunta de Fase 6: cuando un retrain produce un candidato, como se
+  decide si reemplaza al modelo en produccion?
+- Approach: McNemar's test pareado sobre las predicciones de ambos
+  modelos en el MISMO hold-out (test_hard).
+- Tabla 2x2 de McNemar:
+                     | Candidate correct | Candidate wrong |
+    Prod correct     |        a          |       b         |
+    Prod wrong       |        c          |       d         |
+  * b = casos donde prod acerto y candidato fallo (regresiones).
+  * c = casos donde candidato acerto y prod fallo (mejoras).
+  * Statistic: (|b - c| - 1)^2 / (b + c) ~ chi-squared(df=1).
+  * p-value < 0.05 -> diferencia estadisticamente significativa.
+- Decision rule de promocion (Fase 6):
+    accuracy_delta >= +1pp  AND  p < 0.05  -> promover.
+- Por que McNemar y no t-test de accuracy:
+  * Accuracy delta puro no controla varianza. Un +1pp con 50 samples
+    es ruido; el mismo +1pp con 5000 es senal.
+  * McNemar es PAREADO: usa el hecho de que ambos modelos vieron LOS
+    MISMOS inputs. Reduce varianza vs comparacion independiente.
+  * Alternativa descartada: bootstrap de accuracy. Mas pesado
+    computacionalmente para mismo poder estadistico.
+- Por que +1pp como threshold:
+  * Conservador. Cambios <1pp no justifican el riesgo de regression
+    en produccion.
+  * Empirico: ruido del split es ~0.5pp. +1pp es 2x ruido = senal real.
+
+REPRODUCIBILIDAD DEL EVAL
+- Seed fijo (42) en data loading, model init, augmentation si la hubiera.
+- deterministic=True en Lightning Trainer.
+- W&B Artifacts con lineage: cada eval queda atado a
+  embeddings:vN + splits:vN + model:vM. Si alguien pregunta "como
+  obtuviste 0.8125?", responder con run_id de W&B + artifact versions.
+- Reproducibilidad bit-a-bit verificada: ONNX inference vs PyTorch
+  inference dan resultados identicos hasta epsilon numerico.
+  Verificacion documentada en Lambda deployment (0.9614 bit-identico
+  vs local en el smoke test post-deploy).
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Separacion deliberada test_clean vs test_hard (no es un detalle, es
+  diseno).
+- Framework de eval reusable, no scripts ad-hoc.
+- Importacion de lambda/handler.py garantiza paridad eval-vs-prod.
+- Cache per-window para iteracion rapida (eficiencia operacional).
+- Multiples dimensiones de error analysis (especie, confianza,
+  duracion, source).
+- Deteccion de label noise sin libs pesadas (cleanlab not needed
+  aqui).
+- Benchmark riguroso vs alternativa obvia (BirdNET nativo) con
+  resultados grandes Y caveats honestos (Pipile faltante, escalas de
+  confianza incompatibles).
+- McNemar para comparacion de modelos (test estadistico correcto, no
+  comparacion ingenua de accuracy).
+- Reproducibilidad bit-a-bit verificada en deployment real.
+
+
+================================================================================
+ETAPA 6 — Deployment & Serving
+================================================================================
+
+TOPOLOGIA COMPLETA DEL SISTEMA EN PRODUCCION
+- Diagrama de flujo end-to-end:
+
+    [Usuario en mobile/desktop]
+              |
+              | upload audio (MP3/WAV/M4A, <=15MB, <=90s)
+              v
+    [HuggingFace Spaces: Gradio frontend (app.py + client.py)]
+              |
+              | (1) Validacion en navegador (mutagen.js): tipo/duracion
+              | (2) Request presigned URL al backend
+              v
+    [API Gateway HTTP API]   -- POST /upload-url
+              |
+              v
+    [Lambda Docker container (us-east-1)]
+              |
+              | retorna presigned URL + Tagging firmado
+              v
+    [Frontend sube audio directo a S3 con header x-amz-tagging]
+              |
+              v
+    [S3 bucket conocetuave-py-uploads, default tag retain=false]
+              |
+              | POST /predict con s3_key
+              v
+    [API Gateway HTTP API]   -- POST /predict
+              |
+              v
+    [Lambda Docker]
+              |
+              |  Capa 1: pre-filter espectral (white_noise/pure_tone)
+              |  Capa 2: BirdNET TFLite gate (not_a_bird)
+              |  Capa 3: ONNX classifier 20-clases
+              |
+              | escribe prediction a DynamoDB
+              v
+    [DynamoDB tabla bird-classifier-py-data, item PREDICTION]
+              |
+              | response top-1/top-3 al usuario
+              v
+    [Gradio muestra resultado + UI feedback opcional]
+              |
+              | si user da feedback con training_consent=true
+              v
+    [API Gateway HTTP API]   -- POST /feedback
+              |
+              v
+    [Lambda Docker]
+              |
+              | UpdateItem en DDB + PutObjectTagging S3 (retain=true)
+              v
+    [Audio sobrevive lifecycle, queda disponible para Fase 6 retrain]
+
+- Servicios usados (todos AWS + HF):
+  * HuggingFace Spaces (frontend gratis + auth basic optional).
+  * AWS API Gateway HTTP API (entry point HTTPS).
+  * AWS Lambda Docker (compute, hasta 10GB RAM, hasta 15min timeout).
+  * AWS S3 (storage de audios, con lifecycle 30d).
+  * AWS DynamoDB (audit trail + rate limit + feedback).
+  * AWS ECR (registro de imagen Docker).
+  * AWS EventBridge (scheduler de warming, rate(7min)).
+  * AWS CloudWatch (logs + access logs + metrics).
+
+POR QUE SERVERLESS
+- Decision: AWS Lambda Docker como compute primario, no EC2/ECS/EKS.
+- Por que serverless:
+  * $0 cuando nadie usa el sistema (cero idle cost). Critico para
+    proyecto sin revenue.
+  * Free tier generoso: 1M requests/mes + 400k GB-segundos.
+  * Cero administracion de SO/patches/kernel updates.
+  * Auto-scaling natural: 1 user o 100 concurrent, no me importa.
+- Trade-off aceptado: cold start de 30-42s primera invocacion. Mitigado
+  con EventBridge warming (rate 7min). Detalle en seccion dedicada
+  abajo.
+- Alternativas descartadas:
+  * EC2 dedicado: costo idle inaceptable (~$5-15/mes minimum).
+  * ECS Fargate: similar a Lambda Docker pero mas complejo de orquestar
+    para 1 endpoint sin trafico sostenido.
+  * EKS: massive overkill para 1 modelo en 1 endpoint. Costo control
+    plane $73/mes solo por existir.
+
+LAMBDA CONTAINER (NO ZIP + LAYERS)
+- Decision: Lambda con container image (Docker), no el formato ZIP +
+  Lambda Layers tradicional.
+- Por que container:
+  * Tamano: BirdNET TFLite (~50MB) + ONNX Runtime + librosa + numpy +
+    scipy + boto3 supera el limite ZIP de 250MB (descomprimido). El
+    limite de Lambda container es 10GB.
+  * Reproducibilidad: Dockerfile como source of truth de la imagen.
+    Layers tradicionales requieren build scripts ad-hoc.
+  * Dev parity: la misma imagen corre en local con
+    `docker run -p 8080:8080`.
+- Imagen base: AWS Lambda Python 3.12 runtime, multi-stage build.
+  Stage 1 instala deps de build (gcc, libsndfile-devel), stage 2 copia
+  solo lo necesario al runtime AL2023 minimal.
+- Trampas que se resolvieron (gotchas reales del deploy):
+  * docker buildx default produce OCI manifest, Lambda solo acepta
+    Docker manifest v2. Solucion: `--provenance=false --sbom=false`.
+  * Numba (dep transitiva de librosa) escribe JIT cache en disco. AL2023
+    Lambda solo permite escribir en /tmp. Solucion: `ENV
+    NUMBA_CACHE_DIR=/tmp`.
+  * AL2023 minimal NO trae `find` (esperado). Hubo que ajustar scripts
+    de cleanup en el Dockerfile.
+
+API GATEWAY: HTTP API, NO REST API, NO LAMBDA FUNCTION URL
+- Decision arquitectonica (D11 del registro de ADR).
+- Por que HTTP API (no REST API):
+  * Latencia: HTTP API ~10-20ms overhead, REST API ~30-50ms. La
+    diferencia se nota en warm calls.
+  * Costo: HTTP API ~70% mas barato que REST.
+  * Features que NO necesitamos del REST API: API keys, usage plans,
+    request/response transforms, X-Ray, WAF integrado, AWS_IAM authz.
+- Por que HTTP API (no Lambda Function URL):
+  * Function URL no soporta throttling granular. Lambda concurrent
+    execution limit es duro y global, no por route.
+  * Function URL no soporta CORS rico (solo wildcard o origen unico).
+  * HTTP API permite multiples rutas (/upload-url, /predict, /feedback,
+    /warm) sobre la misma Lambda con routing limpio.
+- Configuracion:
+  * Throttling: 20 req/sec sustained + 10 burst. Explicitos, no
+    defaults (los defaults de la cuenta son 10000/5000 = inutiles
+    para rate limit por usuario).
+  * CORS configurado en API GW solo (handler limpio, no devuelve
+    headers CORS).
+  * Access logs habilitados en CloudWatch (Fase 5A).
+- Gotcha medido: throttle activo devuelve 503 Service Unavailable, NO
+  429 Too Many Requests. El frontend tiene que manejar AMBOS codigos.
+
+S3 STRATEGY: PRESIGNED URLS + TAG-ON-CONSENT
+- Decision: el frontend sube audios DIRECTO a S3, no via Lambda.
+- Por que direct-to-S3:
+  * Lambda tiene limite de 6MB en payload sincronico. Audios de 15MB
+    no entran.
+  * Eliminar el "round trip" Lambda -> S3 -> Lambda ahorra latencia y
+    costo (Lambda no paga por bytes que pasaron por el).
+  * Lambda devuelve presigned URL (signed con SigV4), valida durante
+    10 minutos.
+- Configuracion del presigned URL:
+  * Content-Type matchea lo declarado por el cliente (defense in depth,
+    si el cliente cambia el MIME al subir, falla SignatureDoesNotMatch).
+  * Content-Length-Range constrained (1KB-15MB).
+  * x-amz-tagging=retain=false firmado (Fase 5B). El cliente DEBE
+    mandar este header al subir; sino, fail.
+  * Key UUID4 generado por Lambda (no por cliente). Asi no se puede
+    sobrescribir un audio existente cambiando la key.
+- Lifecycle rule (S3): borra objetos con tag retain=false a los 30
+  dias. Objetos con tag retain=true sobreviven indefinido.
+- Tag-on-consent flow (Fase 5B):
+  1. Audio se sube con tag retain=false (default).
+  2. Si el usuario da feedback con training_consent=true, Lambda hace
+     PutObjectTagging para cambiar el tag a retain=true.
+  3. Lifecycle preserva el objeto.
+- Por que tag DEFAULT false + opt-in true (modelo inclusivo):
+  * S3 lifecycle NO soporta filtros exclusivos por tag (verificado
+    contra docs AWS).
+  * Si default fuera retain=true y opt-out false, no podriamos
+    expresar "borra solo los no-consentidos" en la lifecycle.
+  * Modelo inclusivo: regla "borra si retain=false" es exacta y
+    expresable.
+
+DYNAMODB: SINGLE-TABLE DESIGN
+- Tabla unica: bird-classifier-py-data.
+- Items multiples tipos en la misma tabla (single-table design):
+  * PREDICTION: pk=PRED#<uuid4>, sk="META". Audit trail completo de
+    cada inferencia.
+  * RATE_LIMIT: pk=RATE#<fingerprint>, sk=DAY#YYYY-MM-DD. Counter de
+    requests por usuario por dia.
+- GSI:
+  * by_result_status_and_time: HASH=result_status, RANGE=timestamp.
+    Para queries de "todas las predictions detected del ultimo dia".
+  * by_review_status_and_time: HASH=review_status, RANGE=timestamp.
+    Para el annotator (Fase 5).
+- Por que single-table:
+  * 1 conexion (no N por tipo de item).
+  * Queries cross-type cuestan 1 RCU igual que same-type.
+  * Estandar de DDB (Alex DeBrie). Lo opuesto (1 tabla por entidad)
+    es anti-patron en DDB.
+- Trampa real encontrada: `timestamp`, `ttl`, `date` son palabras
+  reservadas en DDB. Hay que aliasarlas en UpdateExpression con
+  ExpressionAttributeNames (`#ts`, `#ttl`, `#date`). Bug latente si
+  no se hace.
+- TTL: items RATE_LIMIT tienen ttl = now + 24h. DDB los borra
+  automaticamente. Sin esto, la tabla crece linear con usuarios.
+
+COLD START ENGINEERING (FASE 5A)
+- Problema medido: cold start invocacion 30-42 segundos. Inaceptable
+  para UX.
+- Causas identificadas via profiling:
+  * librosa import eager: ~8-12 segundos solo importando.
+  * numba JIT compile en primer invoke: ~10-15 segundos.
+  * BirdNET TFLite load: ~3 segundos.
+  * ONNX session load: ~2 segundos.
+- Solucion en 3 capas (orden de menor a mayor impacto):
+  1. librosa LAZY: import dentro de la funcion, no a nivel modulo.
+     Si la primera invocacion es /warm con WAV dummy, librosa nunca se
+     carga.
+  2. /warm endpoint dedicado: dummy WAV @ 22050 Hz forza el resample
+     interno de BirdNET. Despues el primer /predict real es ~3s en vez
+     de ~30s.
+  3. EventBridge warming: trigger /warm cada 7 minutos. Mantiene el
+     container vivo (Lambda recicla a los 10-15 min sin trafico).
+  4. Client-side retry: si el primer request da 504 (timeout API GW),
+     el cliente reintenta con backoff. Preserve la UI mientras tanto.
+- Resultado post-Fase 5A:
+  * Cold real: 30-42s (cuando container fue reciclado pese a warming).
+  * Warm: 3-5s end-to-end via API GW direct, 1.15s P50 via CloudFront
+    edge.
+- Trade-off: warming consume free tier (8640 invokes/mes). Sigue muy
+  dentro de los 1M gratis.
+
+PIPELINE ANTI-TROLL: 4 CAPAS DEFENSE-IN-DEPTH
+- Modelo de amenaza: usuarios suben audio NO de ave (white noise, tonos
+  puros, voz humana, ruido random) intentando obtener una clasificacion
+  bird-like. Sin defensa, el sistema asignaria una especie a cualquier
+  cosa.
+- Capa 0 (frontend, navegador): mutagen.js valida tipo de archivo +
+  duracion antes de pedir presigned URL. Rechaza con error UX claro,
+  ahorra invoke a Lambda.
+- Capa 1 (presigned URL, S3): Content-Type firmado + size limit
+  enforced. Mismatch -> S3 rechaza upload con SignatureDoesNotMatch.
+- Capa 2 (Lambda pre-BirdNET): pre-filter espectral. Calcula spectral
+  flatness + bandwidth sobre ventanas. Heuristicas:
+  * Spectral flatness p95 > 0.30 AND rms > 0.001 -> white_noise.
+  * Spectral flatness mean < 0.01 AND bandwidth mean < 1000 Hz ->
+    pure_tone.
+  Por que pre-BirdNET: BirdNET es la operacion cara (1-2s/audio).
+  Filtrar lo obvio antes ahorra compute.
+- Capa 3 (Lambda BirdNET gate): si max(BirdNET classifier output) <
+  threshold sobre TODAS las ventanas, result_status="not_a_bird".
+  El clasificador ONNX nunca se invoca. Devolvemos "no es un ave"
+  explicitamente al usuario.
+- Solo si pasan las 4 capas, el ONNX classifier asigna una de las 20
+  especies. Cada rechazo se loggea a DDB como item PREDICTION con
+  result_status diferenciado (white_noise / pure_tone / not_a_bird /
+  detected). Util para metricas de trolleo en dashboard.
+
+IAM LEAST-PRIVILEGE
+- Filosofia: cada componente tiene su propio role/user con permisos
+  minimos. Si un componente se compromete, blast radius limitado.
+- Roles creados:
+  * `bird-classifier-py-inference-role` (Lambda execution role):
+    s3:GetObject + s3:PutObject + s3:PutObjectTagging sobre el bucket
+    de uploads, dynamodb:PutItem/UpdateItem/Query sobre la tabla,
+    logs:CreateLogStream/PutLogEvents. SIN DeleteItem en DDB. SIN
+    s3:DeleteObject.
+  * `bird-annotator-readonly` (Fase 5, user para el annotator):
+    dynamodb:Query/GetItem sobre tabla + indices, dynamodb:UpdateItem
+    SOLO con condition que whitelista [pk, sk, review_status,
+    reviewed_by, reviewed_at, reviewed_label, deferred_until]. Cualquier
+    otro campo -> AccessDenied. s3:GetObject sobre el bucket. Deny
+    explicito de DeleteItem/PutItem/DeleteObject/PutObjectTagging/iam:*.
+  * `bird-retrain-ci` (Fase 6, futuro, para GH Actions): s3:Get/Put,
+    ecr:Push, lambda:UpdateFunctionCode, dynamodb:Query/PutItem sobre
+    tabla training_runs. Sin DeleteItem.
+- Tests integration reales: tests/test_iam_scoping.py (Fase 5) ejecuta
+  contra AWS real cada operacion negada para verificar
+  AccessDeniedException. No mockeado. 6/6 PASS.
+
+COSTOS REALES MEDIDOS
+- Budget mensual de produccion: <$5.
+  * Lambda invokes (incl. warming): $0 (dentro de free tier).
+  * Lambda compute (GB-segundos): $0 (dentro de free tier).
+  * API Gateway requests: $0 (HTTP API tiene 1M gratis primer año).
+  * S3 storage (~1GB activa): <$0.05.
+  * S3 requests: <$0.10.
+  * DynamoDB on-demand: <$0.50 (1 RCU/WCU promedio).
+  * ECR storage (~500MB imagen): $0.05.
+  * CloudWatch logs (~100MB): $0.50.
+  * Egress (audios via CloudFront edge cuando va con Function URL): $0
+    para presigned (direct upload), no pasa por Lambda.
+- Decision arquitectonica de costo: AWS Budgets + Anomaly Detection
+  configurados para alertar si gasto excede $10/mes.
+
+METRICAS OPERACIONALES MEDIDAS
+- Latencia inference pura (BirdNET TFLite + ONNX, sin red): 128ms.
+- Latencia E2E warm via API GW direct: 3-5s.
+- Latencia E2E warm via CloudFront edge: 1.15s P50.
+- Cold start real: 30-42s.
+- Hit rate warming EventBridge: ~85% (cuando un user llega caliente).
+- Reproducibilidad: 0.9614 bit-identico inference Lambda vs local
+  (verificado en smoke test post-deploy).
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Topologia serverless explicita y justificada (no "use AWS porque si").
+- Decisiones arquitectonicas con trade-offs claros (HTTP API vs REST
+  API vs Function URL, container vs ZIP, direct-S3 vs Lambda-relay).
+- Cold start enginereado en 3 capas, no aceptado pasivamente.
+- Defense-in-depth real (4 capas anti-troll) con razon de costo en
+  cada capa (filtrar barato antes de filtrar caro).
+- IAM least-privilege auditado con tests reales (no doc-only).
+- Costos medidos, no estimados.
+- Reproducibilidad bit-a-bit entre dev y prod, verificada.
+- Documentado: gotchas tecnicas no obvias (OCI manifest, Numba cache,
+  reserved keywords DDB, 503 vs 429). Esto demuestra que el sistema
+  fue REALMENTE deployado, no solo planeado.
+
+
+================================================================================
+ETAPA 7 — Monitoring & Continual Learning
+================================================================================
+
+FILOSOFIA DE MONITORING
+- Dos categorias de metricas, monitoreadas separadas:
+  * Operacionales: latencia, error rate, throughput, cold start
+    frequency, costo. Sirven para "el sistema esta vivo y respondiendo
+    bien".
+  * De modelo: confidence distribution, result_status breakdown, top
+    species predichas, feedback rates, label shift sospechoso. Sirven
+    para "el modelo sigue dando predicciones razonables".
+- Por que separar: un sistema puede estar 100% disponible respondiendo
+  prediciones absurdas. Ambas categorias hay que mirar.
+- Decision de single-source-of-truth: DynamoDB. Toda inferencia
+  genera un item PREDICTION con campos suficientes para reconstruir
+  metricas downstream. CloudWatch logs son secundarios (debugging,
+  no metricas).
+
+DYNAMODB COMO BASE DE OBSERVABILIDAD
+- Cada inferencia escribe un item PREDICTION con:
+  * timestamp (ISO 8601).
+  * fingerprint (8-char prefix del hash del user, para metricas de
+    usuario sin PII).
+  * result_status: detected / not_a_bird / pure_tone / white_noise.
+  * top1_species + top1_confidence (si result_status=detected).
+  * top3_predictions (full ranked list, para auditoria).
+  * inference_time_ms (latencia pura, sin red).
+  * audio_duration_s + audio_size_bytes.
+  * model_version (qua modelo produjo la prediccion).
+  * training_consent (autorizo el usuario uso para training?).
+  * feedback_status: none / confirmed / corrected / rejected_as_non_bird.
+  * review_status: pending / approved / rejected (de Fase 5 annotator).
+  * reviewed_label (que dijo el experto si corrigio).
+  * s3_key (path al audio en S3 si fue retenido).
+  * ttl (auto-delete a 30 dias si no fue promovido a retain).
+- Por que en DDB y no en S3 como JSONL/Parquet:
+  * Queries ad-hoc por GSI (filtrar por result_status, por
+    review_status, por timestamp).
+  * Updates idempotentes (feedback puede llegar dias despues de la
+    prediction).
+  * Cost-effective para volumen del proyecto (on-demand DDB <$1/mes).
+- Por que NO en una base relacional (RDS Postgres):
+  * RDS minimum ~$15/mes solo por existir.
+  * No necesitamos JOINs sofisticados. Single-table DDB cubre todos
+    los access patterns identificados.
+
+DASHBOARD DEL ANNOTATOR (FASE 5 — TAB ADMIN-ONLY)
+- Localizado dentro del HF Space privado bird-annotator-py, tab
+  visible solo si username == ADMIN_USERNAME (defense in depth: tab
+  hidden + server-side check).
+- Componentes del dashboard:
+  * 8 big number cards:
+    - Total predictions ultimas 24h.
+    - Active users (unique fingerprints) ultimas 24h.
+    - Pending review count.
+    - Approved review count.
+    - Rejected review count.
+    - Consent rate (% predictions con training_consent=true).
+    - Feedback rate (% predictions con feedback_status != "none").
+  * LinePlot: actividad ultimas 24h, predictions por hora. Detecta
+    spikes de trafico (real o trolleo).
+  * BarPlot: top especies predichas ultimos 7d, solo result_status
+    =detected. Muestra el "uso real" del clasificador.
+  * BarPlot: result_status distribution all-time. Detected vs
+    pure_tone/white_noise/not_a_bird. Ratio alto de rejected => mucho
+    trolleo llegando o pipeline anti-troll funcionando bien (depende
+    del contexto).
+  * Security table: top fingerprints hoy con request_count. Detecta
+    fingerprints cerca del rate limit de 30/dia. Audit manual si algo
+    parece anormal.
+- Implementacion: un scan paginado de la tabla + agregaciones in-memory
+  con pandas. NO Athena ni Redshift; el volumen es chico (<100k items),
+  scan completo cuesta ~1 segundo y centavos.
+
+METRICAS DE MODELO EN PRODUCCION (CONTINUAL VIEW)
+- Confidence distribution: histograma de top1_confidence sobre los
+  ultimos N dias. Si la mediana baja sistematicamente -> posible drift
+  (audios reales mas dificiles que el training set), o degradacion del
+  modelo.
+- result_status breakdown:
+  * % detected (audios validos clasificados).
+  * % not_a_bird (BirdNET filtro).
+  * % white_noise + % pure_tone (pre-filter capa 1).
+  * Si el ratio cambia significativamente -> investigar.
+- Top-1 entropy: para una prediccion detected, distribucion top1
+  uniforme sobre las 20 especies o concentrada? Si todo se predice
+  como una sola especie -> hay un sesgo grave.
+- Feedback patterns:
+  * confirmed_rate: % de feedback positivo. Aproximacion de accuracy
+    en produccion (con sesgo: usuarios que se molestan en dar feedback
+    no son representativos).
+  * corrected_rate: % de feedback que corrige a otra especie. Esta es
+    senal MAS VALIOSA — hard examples para Fase 6.
+  * rejected_as_non_bird_rate: % de feedback "no era ave". Si sube,
+    indica que el clasificador esta hablandi mucho cuando deberia
+    estar callado (gate BirdNET demasiado permisivo).
+
+DRIFT DETECTION (LO QUE NO HACEMOS PERO HABRIA QUE HACER)
+- Honesto reconocimiento: NO tenemos drift detection formal.
+- Aproximaciones que tenemos (mencionadas arriba):
+  * Confidence distribution monitoring (manual via dashboard).
+  * Feedback corrections como senal de errores en aumento.
+  * result_status breakdown shift.
+- Lo que faltaria para un sistema mas maduro:
+  * Embedding drift (KS test sobre distribucion de embeddings recientes
+    vs training set).
+  * Prediction shift (KS test sobre distribucion de top1_species
+    predichas).
+  * Performance proxies sin ground truth (e.g., agreement entre top-1
+    y top-2 confidence).
+- Por que no lo agregamos:
+  * Volumen actual chico (16-100 predictions/dia). Cualquier test
+    estadistico daria ruido puro.
+  * Cuando el volumen crezca (si crece), agregarlo. Es decision
+    aplazada, no descartada.
+
+FEEDBACK LOOP COMO ENGRANAJE DEL CONTINUAL LEARNING
+- Modelo conceptual: el usuario es un "oraculo debil". Sabe si el
+  resultado es razonable o no para su grabacion, pero su label puede
+  ser ruidoso.
+- Tres tipos de feedback (`feedback_status`):
+  * `confirmed`: usuario dice "si, es la especie X que predijiste".
+    Senal de que top1_species es correcto.
+  * `corrected`: usuario corrige a especie Y (de las 20). Senal de
+    error del modelo + ground truth alternativo.
+  * `rejected_as_non_bird`: usuario dice "no era un ave". Senal de
+    error del gate BirdNET (deberia haber dicho not_a_bird).
+- Por que SEPARADO del review humano del annotator (Fase 5):
+  * Usuario tiene incentivo de "salir del flow rapido" -> ruidoso.
+  * Ornitologo del annotator es experto -> ground truth confiable.
+  * El feedback de usuario es una HINT, no un label. El ornitologo
+    confirma o rechaza.
+- Pipeline de continual learning:
+
+    user feedback (ruidoso)  ->  DDB feedback_status
+                                       |
+                                       v
+    ornitologo review (annotator)  ->  DDB review_status=approved + reviewed_label
+                                       |
+                                       v
+    Fase 6 retrain loop (futuro)  ->  filtra approved + consent
+                                       |
+                                       v
+    nuevo modelo candidato            evalua con McNemar contra prod
+                                       |
+                                       v
+    promote o reject                  via UI tab Training
+
+ANNOTATOR (FASE 5) COMO BRIDGE A CONTINUAL LEARNING
+- Repo separado: `bird-annotator-py` (sibling de bird-classifier-py).
+- HF Space privado con basic auth multi-rol (annotator vs admin).
+- Lee items PREDICTION con filtros aplicados:
+    review_status = pending
+    AND training_consent = true
+    AND result_status = "detected"
+    AND (deferred_until absent OR <= now)
+- UI 4 casos contextuales:
+  * "Si, es {top1_species}" -> review_status=approved,
+    reviewed_label=top1_species (modelo acerto, easy example).
+  * "No, es OTRA" -> grid de 19 especies -> reviewed_label=especie_X
+    (modelo erro, HARD EXAMPLE — oro para Fase 6).
+  * "Ninguna de las 20" -> review_status=rejected, sin reviewed_label.
+  * "Pasa por ahora" -> deferred_until = now + 24h.
+- Por que esta granularidad: separar "modelo erro pero corrijo" de
+  "modelo erro pero no se" es CRITICO para Fase 6. Solo el primero es
+  training data util. Mezclarlos baja calidad del dataset retraineado.
+
+EVENTBRIDGE WARMING COMO AUTO-HEALING
+- Schedule: rate(7 minutes), invoca Lambda con event {"path": "/warm"}.
+- Sirve dos propositos:
+  * Mantener container vivo (mitiga cold start).
+  * Heartbeat de "el sistema sigue respondiendo". Si /warm empieza a
+    fallar (CloudWatch metric), alarma.
+- Decision de cadence: 7 minutos porque Lambda recicla containers a
+  ~10-15 min sin trafico. 7 min garantiza siempre warm con margen.
+  Menos cadence (15min) -> mas cold starts. Mas cadence (3min) -> mas
+  invokes desperdiciados.
+
+COSTO MONITORING
+- AWS Budgets: alarma si gasto excede $10/mes (current actual <$5).
+- AWS Cost Anomaly Detection: alerta si pattern cambia bruscamente
+  (e.g., un loop infinito de Lambda invocandose a si misma).
+- Por que importa para CV interview: demuestra disciplina operacional
+  no solo tecnica. Un ML engineer que no mide costo de su sistema es
+  un ML engineer junior.
+
+RETRAINING LOOP (FASE 6 — DONDE ESTE DOC ENCAJA)
+- Fase 6 es la EJECUCION de continual learning. Cierra el loop.
+- Trigger: admin (yo) aprieta boton en UI tab Training del annotator.
+  No es cron, no es automatico por volumen. Human-in-the-loop
+  intencional.
+- Pipeline (descripto detalle en plan de Fase 6, ver memory
+  `project-phase6-plan-discussed-2026-05-24`):
+  1. export_dataset.py: filtra approved + consent, descarga audios
+     desde S3, calcula embeddings BirdNET.
+  2. train.py: re-entrena MLP desde scratch (Enfoque C, ver Etapa 4).
+  3. evaluate.py: McNemar's test contra modelo en produccion sobre
+     test_hard.
+  4. Si delta >= +1pp AND p < 0.05 -> aparece boton "Promover" en UI.
+  5. promote.py: build Docker image, push a ECR, update Lambda
+     function code.
+  6. Smoke test post-deploy. Si falla, rollback via promote.py
+     --version <tag_anterior>.
+- Por que human-in-the-loop entre evaluate y promote:
+  * Ver el reporte (delta, p-value, confusion matrix, per-species
+    F1) antes de promover.
+  * Si McNemar dio verde pero regresion en una especie critica, NO
+    promover.
+  * Demuestra entender riesgo de auto-deploy en CV interview.
+- Donde encaja test_hard en el loop: NO se aumenta con approved del
+  annotator. test_hard es sagrado (Etapa 2). Solo se usa el training
+  set para incorporar approved. Hold-out queda fijo para comparar
+  modelos a lo largo del tiempo.
+
+ESTADO ACTUAL DEL SISTEMA (AL ARRANCAR FASE 6, 2026-05-25)
+- Fases COMPLETADAS:
+  * Fase 0-3: data pipeline + scripts + model training + ONNX export.
+  * Fase Lambda deploy + API Gateway: backend live en
+    https://1jbbnu85e5.execute-api.us-east-1.amazonaws.com/prod/
+  * Fase Gradio: frontend live en HF Spaces (conocetuave-py).
+  * Fase 2: pipeline anti-troll 4 capas.
+  * Fase 3: S3 + presigned URLs (audios hasta 90s/15MB).
+  * Fase 4: DynamoDB + rate limit + consent + feedback endpoint.
+  * Fase 5A: cold start fix + EventBridge warming.
+  * Fase 5B: S3 retention con tag-on-consent.
+  * Fase 5 annotator + dashboard admin.
+- Fase 6 — EN CURSO:
+  * 6.0 RETRAINING_STRATEGY.md (ESTE DOCUMENTO).
+  * 6.1 Formalizar hold-out (politica inmutable).
+  * 6.2 Seed data generator.
+  * 6.3 Scripts standalone (export, train, evaluate, promote).
+  * 6.4 IAM + training_runs + GH Actions workflow.
+  * 6.5 UI tab Training en annotator.
+  * 6.6 Rollback.
+  * 6.7 Demo run E2E + screenshots.
+  * 6.8 README final (ambos repos).
+
+EN RESUMEN, LO QUE DEMUESTRA ESTA ETAPA EN CV INTERVIEW
+- Monitoring separado en operacional y de modelo (no se confunden).
+- Single source of truth (DDB) que sostiene dashboards downstream
+  sin doble escritura.
+- Dashboard real construido y deployado, no mockup.
+- Drift detection NO presente pero documentado honestamente (que
+  faltaria + por que se aplazo). Mejor que pretender.
+- Feedback loop modelado correctamente: user feedback como hint
+  ruidoso, ornitologo como ground truth experto.
+- Continual learning con human-in-the-loop deliberado (no auto-deploy
+  por miedo, deliberadamente por buen criterio).
+- Hold-out sagrado preservado a lo largo del loop (no contaminacion
+  con datos nuevos).
+- Costo monitoring activo (Budgets + Anomaly Detection).
+- Sistema entendido como ciclo cerrado, no como pipeline lineal de
+  un solo uso.
+
+
+================================================================================
+EPILOGO — DECISIONES TRANSVERSALES QUE DEFINEN EL PROYECTO
+================================================================================
+
+Algunas decisiones aparecen en multiples etapas porque son transversales.
+Las resumo aca para tener un overview rapido:
+
+1. DATA QUALITY > MODEL TUNING
+   - La mejora real (0.78 -> 0.81 hard acc) vino de drop+rescate de
+     especies (Fase 5), no de cambios al MLP.
+   - Lesson aprendida y publicada en este doc honestamente.
+
+2. EVAL Y PROD COMPARTEN CODIGO (lambda/handler.py)
+   - Los scripts de eval importan handler.py via importlib.
+   - Garantiza paridad bit-a-bit entre eval y produccion.
+   - Sin esto, podes optimizar para una distribucion que no es la real.
+
+3. METRICA PRIMARIA = HARD ACC + MACRO F1
+   - Hard porque aproxima dominio real, no estudio.
+   - Macro porque desbalance es real.
+   - Cualquier decision (model selection, promotion, A/B) usa estas dos.
+
+4. HUMAN-IN-THE-LOOP DELIBERADO
+   - Annotator (Fase 5): ornitologo confirma o corrige.
+   - Promotion en Fase 6: admin aprueba retrain antes de deploy.
+   - No es falta de automatizacion, es eleccion arquitectonica.
+
+5. SCOPE CERRADO (NO FEATURE CREEP)
+   - 20 especies finales (no abrir a 50 ni a "todas las de PY").
+   - No real-time streaming, no multi-label.
+   - Donacion gratis a zoos/ONGs PY, no producto comercial.
+   - Esto justifica no agregar features que no aportan al objetivo CV.
+
+6. DEFENSE-IN-DEPTH SIN PARANOIA
+   - Anti-troll en 4 capas (cada una mas cara, filtrar lo barato
+     primero).
+   - IAM least-privilege con tests reales.
+   - PERO no agregamos WAF, CDN custom, ni servicios que no aportan al
+     budget <$5/mes.
+
+7. REPRODUCIBILIDAD MEDIBLE
+   - Seed=42 + deterministic=True en training.
+   - W&B Artifacts con lineage explicito.
+   - Bit-a-bit verificado entre Lambda y local (0.9614).
+   - Permite responder "como obtuviste este numero?" con un run_id.
+
+8. COSTOS COMO RESTRICCION ARQUITECTONICA, NO AFTERTHOUGHT
+   - Decisiones de Lambda Docker (no EC2), HTTP API (no REST), DDB
+     on-demand (no RDS), S3 lifecycle (no Glacier early) tomadas con
+     budget medido.
+   - <$5/mes real, no estimado.
+
+================================================================================
+FIN DEL DOCUMENTO RETRAINING_STRATEGY
+================================================================================
+
