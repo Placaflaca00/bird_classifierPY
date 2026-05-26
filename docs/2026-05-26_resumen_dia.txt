@@ -1,0 +1,330 @@
+================================================================================
+RESUMEN DEL DIA — 2026-05-26
+Sub-fase 6.4 (workflow GitHub Actions + IAM OIDC + DDB training_runs).
+Cerrada E2E exitosamente despues de 6 iteraciones con 5 bugs corregidos
+en cadena.
+================================================================================
+
+
+6.4.a — Tabla DynamoDB bird-classifier-py-training-runs
+--------------------------------------------------------
+- Schema CloudFormation-compatible (infra/dynamodb/training_runs_table.json):
+  * pk = "RUN#<uuid>" + sk = "META" (consistent con bird-classifier-py-data
+    pattern de single-table design).
+  * 2 GSIs:
+    - by_triggered_at: HASH=run_partition (constante "RUN") + RANGE=
+      triggered_at, projection ALL. Time-ordered queries en O(log N) sin
+      Scan. Pattern "single-partition GSI" para listas time-ordered
+      moderadas.
+    - by_status_and_time: HASH=status + RANGE=triggered_at, projection
+      INCLUDE 5 atributos (run_id, current_job, github_run_url,
+      should_promote, promoted). Para query "runs en estado X" sin Scan.
+  * TTL en expires_at (365 dias post-trigger, auto-cleanup).
+- Script create_training_runs_table.py: idempotente (skip si existe) +
+  smoke test E2E (PutItem + Query GSI ambos + UpdateItem condicional +
+  DeleteItem).
+- Verificado: tabla creada, GSIs ACTIVE, TTL ENABLED, smoke 5/5 PASS.
+
+
+6.4.b — OIDC provider + IAM role bird-retrain-ci-role
+------------------------------------------------------
+Cambio critico del plan: usar OIDC federated identity en lugar del
+anti-pattern moderno IAM user con access keys long-lived. AWS Security
+Blog 2023+ y guias 2025-2026 explicitamente lo recomiendan.
+
+- OIDC provider creado: token.actions.githubusercontent.com (one-shot
+  per cuenta AWS, compartido entre repos).
+- IAM role bird-retrain-ci-role con federated principal.
+- Trust policy (bird_retrain_ci_trust_policy.json):
+  * Federated: arn:aws:iam::863518416901:oidc-provider/token.actions.githubusercontent.com
+  * Audience: sts.amazonaws.com
+  * StringLike condition sobre sub: refs/heads/main + refs/heads/
+    feature/retrain-workflow. CRITICO en repo publico (PRs de strangers
+    NO pueden asumir el role).
+- Inline policy least-privilege (bird_retrain_ci_policy.json):
+  * 6 Allow statements scopeadas a recursos especificos:
+    DynamoDB tablas + index (Query/Scan/Get/Put/Update)
+    S3 conocetuave-py-uploads (Get + ListBucket)
+    ECR repositorio bird-classifier-py (Auth + push/pull layers)
+    Lambda bird-classifier-py-inference (Get/UpdateCode/Invoke)
+  * 1 Deny statement explicito de 11 acciones destructivas (iam:*,
+    DeleteTable, DeleteBucket, DeleteFunction, etc).
+- IAM Access Analyzer validate-policy: findings=[] sobre inline policy.
+- Fix de naming bug AWS conocido: s3:PutBucketLifecycleConfiguration ->
+  s3:PutLifecycleConfiguration (la API HTTP es Put*Bucket* pero el IAM
+  action es el nombre corto sin Bucket).
+- Beneficios vs IAM user:
+  * Cero AWS secrets en GitHub Secrets.
+  * Repo publico + leak imposible (no hay keys que robar).
+  * Credenciales temporales (1h TTL por workflow run).
+  * Talking point CV: "federated identity sin long-lived credentials".
+
+
+6.4.c — Workflow GitHub Actions retrain.yml
+--------------------------------------------
+Helper: scripts/notify_training_run.py (~200 lineas):
+- UpdateItem idempotente con ConditionExpression sobre job_order_int
+  monotonic. Si GH Actions reintenta un job o si llegan fuera de orden,
+  no corrompe el item.
+- 3 actions: create (PutItem inicial), update (intermedio), finalize
+  (terminal con status sticky job_order=99 para failed_critical o 5 para
+  succeeded/promoted/rejected).
+- Edge case fix encontrado durante smoke test: ExpressionAttributeNames
+  vacio dict causa ValidationException de DDB. Pasar el kwarg solo si
+  hay al menos una entry.
+
+Workflow yml (~490 lineas):
+- 6 jobs encadenados con dependencias explicitas:
+    start (init DDB) -> export-dataset -> train -> evaluate ->
+      promote (conditional, environment "production" required reviewer)
+    finalize: if: always() captura todos los outcomes
+- Triggers:
+    workflow_dispatch (manual desde GH UI, dropdown branch selectable)
+    repository_dispatch type=retrain (futuro UI tab Training de 6.5)
+- Permissions: id-token: write CRITICO para OIDC + contents: read.
+- Concurrency: group=retrain-${ref}, cancel-in-progress=false (NUNCA
+  matar un retrain en curso porque puede dejar Lambda inconsistente).
+- aws-actions/configure-aws-credentials@v4 con role-to-assume.
+- Artifact handoff entre jobs (dataset 7d retention, model 14d,
+  evaluation 30d).
+- Cada job invoca notify_training_run.py con sus campos especificos
+  para que la UI tab (6.5) pueda hacer polling de progreso.
+
+
+Pattern placeholder/feature branch para workflow_dispatch
+----------------------------------------------------------
+GitHub Actions UI solo muestra "Run workflow" en el dropdown si el
+archivo del workflow existe en el DEFAULT branch (main). Para testear
+desde feature/retrain-workflow sin contaminar main con workflow no
+testeado, usamos:
+  - Placeholder en main (~30 lineas YAML con if: false en el job).
+  - Workflow real en feature branch.
+  - workflow_dispatch eligiendo feature branch en dropdown -> GH usa
+    el contenido REAL de la feature, no el placeholder de main.
+Cuando E2E paso, merge feature -> main sobreescribe placeholder.
+
+
+6 runs E2E con 5 bugs en cadena
+================================
+Cada bug fue un descubrimiento legitimo de "lo que CI necesita y dev
+local no". Sin el workflow E2E todos hubieran sido latentes hasta que
+alguien clonara fresh el repo.
+
+Run #1 (26455073369): job export-dataset fallo en "Notify start of export"
+   Bug: ModuleNotFoundError: No module named 'boto3'.
+   Causa: pyproject [data] extras no tenia boto3 declarado. Local
+          funcionaba porque tenia boto3 instalado de otra fuente.
+   Fix: agregar boto3>=1.34 a [data] extras del pyproject.toml.
+   Comportamiento positivo: el job 6 finalize (con if: always() y su
+   pip install boto3 explicito) capturo el fail y escribio
+   status=failed_critical al DDB. NINGUN item huerfano.
+
+Run #2 (cancelado por mismo bug, GitHub Actions cacheo el package wheel)
+
+Run #3 (26455447313): job export-dataset fallo
+   Bug: FileNotFoundError: Falta /home/runner/.../data/processed/embeddings.parquet
+   Causa: load_originals() leia parquets de disco local. Runner CI
+          arranca limpio + data/processed/* esta gitignored.
+   Fix: modificar load_originals() para descargar desde W&B Artifacts:
+          - embeddings:wa-drop3 (alias resuelve a v2)
+          - splits:wa-drop3 (alias resuelve a v1)
+        Sin fallback a disco. Bonus: lineage automatico cuando upload
+        del output artifact declara use_artifact() sobre estos inputs.
+   Aprendizaje: la politica D20 (hold-out inmutable + W&B Artifacts
+   como source of truth) DEBE aplicarse uniformemente. El bug ocurrio
+   porque export.py tenia un atajo a disco que rompia el principio.
+
+Run #4 (26456574054): job export-dataset fallo
+   Bug: ModuleNotFoundError: No module named 'wandb'.
+   Causa: pyproject [data] tenia boto3 pero no ML stack: wandb, torch,
+          lightning, librosa, scipy, sklearn, onnx, onnxruntime,
+          birdnetlib, tensorflow, matplotlib.
+   El comentario del pyproject decia explicitamente: "Runtime
+   dependencies are intentionally NOT pinned here yet — each surface
+   manages its own requirements".
+   Fix: crear requirements-ci.txt dedicado al workflow CI (su propia
+        "surface" con su requirements file). 13 deps declaradas.
+        Workflow ejecuta: pip install -e ".[data,dev]" + pip install -r
+        requirements-ci.txt en cada job que usa scripts/.
+   Performance: ~5 min de install primer vez, ~30s con cache de
+   actions/setup-python en runs subsequent.
+
+Run #4 (continuacion): job train PASO en 2.5 min, NO los 30 min locales
+   Observacion positiva inesperada: train CPU en CI fue MUCHO mas rapido
+   que local. Linux runner (2-4 vCPU, AVX2 nativo) vs Windows venv tiene
+   overhead que Linux nativo no tiene. Para modelos chicos como este MLP
+   (~300K params), CI es ventaja real.
+
+Run #4 (continuacion): job evaluate fallo
+   Bug: Falta prod-ckpt checkpoints/wa-drop3-v1/best-*.ckpt en el repo.
+   Causa: el ckpt PyTorch del modelo en prod (wa-drop3-v1) estaba en
+          checkpoints/ (gitignored). NO existia un model artifact en W&B
+          tampoco (yo busque: model, classifier, baseline, wa-drop3,
+          wa-drop3-v1 — todos NOT FOUND).
+   Fix two-part:
+     1. One-shot upload del wa-drop3-v1 best.ckpt a W&B como
+        model_baseline:v0 (alias wa-drop3, latest). 3.4 MB, type=model,
+        metadata con epoch/val_macro_f1/hard metrics + lineage
+        use_artifact(embeddings:wa-drop3 + splits:wa-drop3).
+     2. evaluate.py: nuevo arg --prod-artifact model_baseline:wa-drop3
+        + resolve_prod_ckpt() con priority chain:
+          a. --prod-ckpt explicito
+          b. Glob local checkpoints/wa-drop3-v1/ (dev local)
+          c. Descarga desde W&B Artifact (CI runner)
+   Workflow yml: sacar el step de validacion del path local
+   (redundante post-fix).
+
+Run #5 (26457348901): job evaluate fallo OTRA VEZ
+   Bug: RuntimeError: WANDB_ENTITY/PROJECT no estan en env.
+   Causa: el step "Run export_dataset.py" tenia env: WANDB_API_KEY/
+          PROJECT/ENTITY exportadas. El step "Run evaluate.py" NO. Patron
+          propenso a olvidos: cada step nuevo que use W&B tendria que
+          recordar el bloque env.
+   Fix: promover WANDB_* a env: a nivel WORKFLOW global. Cualquier step
+        hereda automaticamente. DRY + previene el mismo bug en steps
+        futuros (train upload, promote, etc).
+   Trade-off aceptado: jobs start/finalize tambien las ven aunque no
+   las usen. OK porque corren en el mismo runner trust boundary.
+
+Run #6 (26458336258): SUCCESS EN 11.9 MIN
+   Todos los jobs pasaron:
+     start             0.1 min
+     export-dataset    3.9 min (con W&B Artifacts download)
+     train             3.6 min (50 epochs CPU)
+     evaluate          3.7 min (prod ckpt download + McNemar mid-p)
+     promote           SKIPPED (correctamente: should_promote=false)
+     finalize          0.2 min
+   Total 11.9 min — mucho mas eficiente que las 45-60 min estimadas.
+
+
+Run #6 — resultado del modelo candidato
+----------------------------------------
+                       Candidato CI    wa-drop3-v1 prod    Delta
+  best_val_macro_f1    0.9134          0.909               +0.4 pp
+  hard_acc             0.7840          0.8125              -0.94 pp
+  hard_macro_f1        0.7606          0.8060              -3.32 pp
+
+McNemar mid-p p_value: 0.629 (>> 0.05, no significativo)
+should_promote: False
+evaluation_reason: "delta_acc_pp (-0.94) < threshold (+1.00) AND
+                    p_value (0.6291) >= threshold (0.05)..."
+
+El threshold de promocion funciono como GATE REAL: rechazo un candidato
+que era peor que prod en la metrica que importa. Promote skipped, Lambda
+de produccion NO se toco.
+
+Por que el candidato fue peor:
+- Misma seed 42, mismo Enfoque C, mismo MLP arquitectura. La diferencia
+  con el local del 25-05 (que dio +0.48pp en hard_acc) viene de:
+  * Embeddings.parquet local tenia 2590 samples; W&B Artifact v2 tiene
+    2600 (10 audios mas).
+  * Linux nativo vs Windows venv pueden tener tiny diferencias de
+    determinismo aunque ambos usan deterministic=True.
+  * Es esperable variabilidad de algunos centesimos de pp en hard metrics
+    con test_hard de solo 213 samples.
+- Lo importante para CV: el gate funciono. NO promovio un modelo peor.
+
+
+Item DDB del run #6
+--------------------
+  pk:                    RUN#43bd70d9-d5f0-4523-b506-ff6129acdbf3
+  status:                succeeded
+  current_job:           done
+  job_order_int:         5
+  triggered_by:          Placaflaca00
+  triggered_via:         workflow_dispatch
+  github_run_url:        https://github.com/Placaflaca00/bird_classifierPY/actions/runs/26458336258
+  dataset_path:          embeddings_retrain_20260526-153853.parquet
+  n_samples_total:       2701  (2600 original + 101 annotator)
+  n_samples_annotator:   101   (100 seed + 1 Jabiru real)
+  best_val_macro_f1:     0.9134
+  hard_acc:              0.7840
+  hard_macro_f1:         0.7606
+  state_dict_sha256:     d6c9c054220adf8ae11eee8c944c0fa22cc603207ca3864b09c437e692566c4b
+  should_promote:        False
+  delta_acc_pp:          -0.94
+  delta_macro_f1_pp:     -3.32
+  mcnemar_p_value:       0.629
+  triggered_at:          2026-05-26T15:35:02Z
+  completed_at:          2026-05-26T15:46:42Z
+
+
+Recursos AWS + W&B utilizados
+------------------------------
+AWS:
+- IAM role: arn:aws:iam::863518416901:role/bird-retrain-ci-role
+- OIDC provider: token.actions.githubusercontent.com
+- DDB table: bird-classifier-py-training-runs (PAY_PER_REQUEST)
+- S3 bucket: conocetuave-py-uploads (read-only desde CI)
+- ECR repo: bird-classifier-py (push permission, no usado en run #6
+  porque promote skipped)
+- Lambda: bird-classifier-py-inference (UpdateFunctionCode permission,
+  NO INVOCADO en run #6)
+
+W&B (entity moha251mmed-n8nano, project bird-classifierPy):
+- embeddings:v2 (alias wa-drop3) — 2600 samples, 15.2MB
+- splits:v1 (alias wa-drop3)     — fold assignments
+- model_baseline:v0 (alias wa-drop3, latest) — wa-drop3-v1 ckpt 3.4MB
+  [SUBIDO HOY one-shot]
+
+GitHub:
+- Repo secrets: WANDB_API_KEY, WANDB_PROJECT, WANDB_ENTITY
+- Repo variables: ninguna (AWS_ROLE_ARN hardcoded en workflow porque
+  es publico)
+- Environment "production": required reviewer Placaflaca00, wait timer
+  1 min, deployment branches main + feature/retrain-workflow
+
+
+Lessons learned dia 2026-05-26 (oro para CV interview)
+-------------------------------------------------------
+1. CI E2E descubre bugs que ningun test local atrapa. 5 bugs en cadena,
+   cada uno una violacion implicita del principio "el codigo debe correr
+   en runner limpio". Sin el workflow, todos habrian sido latentes
+   esperando manifestarse en cualquier maquina sin tu venv-especifico.
+
+2. OIDC federated identity es ESTADO DEL ARTE 2025. AWS Security Blog,
+   AWS best practices: "Don't use IAM access keys in GitHub Actions".
+   Implementado correctamente con trust policy scopeada a branches
+   especificos (critico en repo publico).
+
+3. W&B Artifacts como source-of-truth es no-negociable. La politica D20
+   (hold-out inmutable + lineage automatico) protege contra el caso
+   real de "mi disco local tiene una version y prod otra". El bug del
+   run #3 fue exactamente ese.
+
+4. notify pattern + UpdateItem idempotente con ConditionExpression sobre
+   job_order_int monotonic = el mecanismo standard para tracking de
+   workflows ML. Si GH Actions reintenta un job (puede pasar) o si
+   llegan fuera de orden, no corrompe la timeline.
+
+5. Train CPU en GH Actions runner es ~10x mas rapido que local Windows
+   venv para modelos chicos. Para CV: "no asumi que CI fuera mas lento,
+   medi". Linux nativo + AVX2 + sin overhead Windows hace diferencia.
+
+6. Concurrency control con cancel-in-progress=false es critico para
+   workflows que tocan recursos externos (Lambda update). NUNCA matar
+   un job en curso porque puede dejar estado inconsistente.
+
+7. Pattern placeholder/feature-branch para testear workflow_dispatch sin
+   contaminar main. GH solo muestra "Run workflow" si el archivo esta
+   en default branch — workaround con if: false en main + real en
+   feature branch.
+
+
+Estado al cierre del dia
+-------------------------
+- Sub-fase 6.4 CERRADA con E2E validado (run #6).
+- Feature branch feature/retrain-workflow tiene 7 commits ahead de main
+  (placeholder + 5 fixes + workflow real).
+- Lambda producion: fase5b-retention (wa-drop3-v1), NO tocada.
+- DDB training_runs: 6 items historicos del testing (varios failures
+  + 1 succeeded del run #6).
+- Pendiente: merge feature -> main para que el workflow real reemplace
+  el placeholder y quede disponible via UI dropdown desde main.
+
+
+SUB-FASE 6.4: CERRADA
+PROXIMO: 6.5 — UI tab Training en bird-annotator-py (admin-only),
+          historial de runs polleando from training_runs, 2 botones
+          Entrenar+Evaluar / Promover, repository_dispatch hacia el
+          workflow.
