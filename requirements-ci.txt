@@ -1,0 +1,42 @@
+# Runtime dependencies para el workflow GitHub Actions de Fase 6 retrain.
+#
+# Por que un archivo separado (no en pyproject [data] ni [dev]):
+#   El pyproject.toml documenta explicitamente "Runtime dependencies are
+#   intentionally NOT pinned here yet — each surface (training notebooks,
+#   lambda/, app/) manages its own requirements". Mantenemos esa filosofia:
+#   el workflow CI es su propia "surface" con su requirements file dedicado.
+#
+# Instalar en CI con:
+#   pip install -r requirements-ci.txt
+#
+# El comando NO incluye `-e .` porque el proyecto se instala primero con
+# `pip install -e ".[data]"` (que trae pandas + pyarrow + boto3 + ...).
+# Este archivo agrega las deps de ML/audio/tracking que faltan.
+
+# --- Tracking ---
+wandb>=0.16
+
+# --- Audio I/O + DSP ---
+librosa>=0.10
+soundfile>=0.12
+scipy>=1.11
+
+# --- ML training ---
+torch>=2.0
+lightning>=2.0
+torchmetrics>=1.0
+
+# --- ML inference (eval + promote) ---
+onnx>=1.15
+onnxruntime>=1.16
+
+# --- BirdNET (feature extractor) ---
+# birdnetlib trae internamente la dependencia de tensorflow / tflite.
+# precompute_embeddings.build_interpreter() usa tf.lite.Interpreter via
+# birdnetlib.analyzer.Analyzer.
+birdnetlib>=0.18
+tensorflow>=2.16
+
+# --- Evaluation + viz ---
+scikit-learn>=1.3
+matplotlib>=3.7

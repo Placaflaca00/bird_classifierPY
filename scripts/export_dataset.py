@@ -132,6 +132,21 @@ def parse_args() -> argparse.Namespace:
         "En produccion (workflow GH Actions con data real), no usar.",
     )
     p.add_argument(
+        "--embeddings-artifact",
+        type=str,
+        default="embeddings:wa-drop3",
+        help="W&B artifact name:alias del embeddings de los originales. "
+        "Default 'embeddings:wa-drop3' matchea wa-drop3-v1 en prod "
+        "(politica D20 inmutabilidad).",
+    )
+    p.add_argument(
+        "--splits-artifact",
+        type=str,
+        default="splits:wa-drop3",
+        help="W&B artifact name:alias del splits.parquet. "
+        "Default 'splits:wa-drop3' idem.",
+    )
+    p.add_argument(
         "--upload-wandb",
         action="store_true",
         help="Despues de escribir local, sube como W&B Artifact con metadata "
@@ -229,23 +244,73 @@ def birdnet_binary_sha256() -> str:
 # Original dataset loading
 # ---------------------------------------------------------------------------
 
-def load_originals() -> pd.DataFrame:
-    """Carga embeddings.parquet + splits.parquet, merge por filepath.
+def load_originals(
+    embeddings_artifact: str, splits_artifact: str,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Descarga embeddings + splits desde W&B Artifacts (NO disco local).
 
-    Output: DataFrame con columnas: filepath, species, fold, embedding,
-    is_aug, aug_id, source ("original"), ddb_pk (None).
+    Por que W&B y no disco:
+      - CI (GH Actions runner) arranca con disco limpio — no existen los
+        parquets locales.
+      - Lineage automatico: el output artifact del export queda vinculado
+        a las versiones EXACTAS de inputs (politica D20).
+      - Cache transparente: ``~/.cache/wandb/artifacts/<hash>/`` post-primer
+        download. Runs subsequentes son instantaneos en dev local.
+
+    Si querés evaluar/entrenar SIN W&B (modo offline), no es path soportado.
+    El proyecto declara W&B Artifacts como source-of-truth del dataset
+    versionado (D20).
+
+    Args:
+        embeddings_artifact: nombre:alias del artifact embeddings.
+        splits_artifact: idem splits.
+
+    Returns:
+        (merged_df, resolved_versions) donde resolved_versions es dict
+        {"embeddings": "embeddings:v2", "splits": "splits:v1"} con la
+        version concreta a la que el alias resolvio. Usar para metadata
+        del output artifact + audit.
     """
-    if not EMB_PATH.exists():
-        raise FileNotFoundError(f"Falta {EMB_PATH}")
-    if not SPLITS_PATH.exists():
-        raise FileNotFoundError(f"Falta {SPLITS_PATH}")
+    import wandb
+    entity = os.environ.get("WANDB_ENTITY", "").strip()
+    project = os.environ.get("WANDB_PROJECT", "").strip()
+    if not entity or not project:
+        raise RuntimeError(
+            "WANDB_ENTITY o WANDB_PROJECT faltan en env. Cargar .env o "
+            "exportar como secret en CI."
+        )
 
-    emb = pd.read_parquet(EMB_PATH)
-    splits = pd.read_parquet(SPLITS_PATH)
+    api = wandb.Api()
+    resolved: dict[str, str] = {}
+
+    print(f"  Descargando {embeddings_artifact} desde W&B...")
+    art_emb = api.artifact(f"{entity}/{project}/{embeddings_artifact}", type="dataset")
+    resolved["embeddings"] = art_emb.name   # e.g. "embeddings:v2"
+    emb_dir = Path(art_emb.download())
+    emb_file = emb_dir / "embeddings.parquet"
+    if not emb_file.exists():
+        raise RuntimeError(
+            f"embeddings.parquet no esta en {emb_dir}. "
+            f"Files: {[f.name for f in emb_dir.iterdir()]}"
+        )
+
+    print(f"  Descargando {splits_artifact} desde W&B...")
+    art_splits = api.artifact(f"{entity}/{project}/{splits_artifact}", type="dataset")
+    resolved["splits"] = art_splits.name
+    splits_dir = Path(art_splits.download())
+    splits_file = splits_dir / "splits.parquet"
+    if not splits_file.exists():
+        raise RuntimeError(
+            f"splits.parquet no esta en {splits_dir}. "
+            f"Files: {[f.name for f in splits_dir.iterdir()]}"
+        )
+
+    print(f"  Resolved: {resolved}")
+    emb = pd.read_parquet(emb_file)
+    splits = pd.read_parquet(splits_file)
     merged = emb.merge(splits, on="filepath", how="inner")
 
-    # Sanidad: post-merge no deberian aparecer folds invalidos. Si pasa,
-    # significa que splits.parquet tiene un valor no esperado.
+    # Sanidad: post-merge no deberian aparecer folds invalidos.
     invalid = set(merged["fold"].unique()) - VALID_FOLDS
     if invalid:
         raise RuntimeError(f"splits.parquet tiene folds invalidos: {invalid}")
@@ -253,15 +318,15 @@ def load_originals() -> pd.DataFrame:
     merged["source"] = "original"
     merged["ddb_pk"] = pd.NA
 
-    # Construir lista de especies validas a partir de los originales. Esto
-    # es la fuente de verdad de las 20 clases del clasificador.
+    # Especies validas a partir de los originales (fuente de verdad de
+    # las 20 clases del clasificador).
     global VALID_SPECIES_20
     VALID_SPECIES_20 = sorted(merged["species"].unique())
     if len(VALID_SPECIES_20) != 20:
-        print(f"! WARNING: embeddings.parquet tiene {len(VALID_SPECIES_20)} "
-              "especies, no 20. Verificar.", file=sys.stderr)
+        print(f"! WARNING: embeddings tiene {len(VALID_SPECIES_20)} especies, "
+              "no 20. Verificar artifact version.", file=sys.stderr)
 
-    return merged
+    return merged, resolved
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +565,14 @@ def upload_to_wandb(
     parquet_path: Path,
     metadata: dict[str, Any],
     alias: str,
+    input_artifacts: dict[str, str],
 ) -> None:
-    """Sube el parquet como W&B Artifact con metadata reproducible."""
+    """Sube el parquet como W&B Artifact con metadata reproducible.
+
+    input_artifacts: dict {"embeddings": "embeddings:v2", "splits": "splits:v1"}
+    de versiones resueltas que load_originals() descargo. Se declaran como
+    use_artifact() para lineage automatico en W&B UI.
+    """
     import wandb
     project = os.environ["WANDB_PROJECT"].strip()
     entity = os.environ["WANDB_ENTITY"].strip()
@@ -513,8 +584,11 @@ def upload_to_wandb(
         name=f"export-{alias}",
         notes="Dataset combinado (original + annotator) para retrain Fase 6.",
     )
-    run.use_artifact("embeddings:v0")
-    run.use_artifact("splits:v0")
+    # Lineage explicito: el output queda vinculado a las versiones EXACTAS
+    # que el export consumio (no aliases — la resolucion de alias->version se
+    # fijo en load_originals).
+    for input_name in input_artifacts.values():
+        run.use_artifact(input_name)
 
     artifact = wandb.Artifact(
         name="embeddings_retrain",
@@ -561,16 +635,19 @@ def main() -> int:
 
     print("=== Export dataset (Fase 6.3) ===", flush=True)
     sha = git_sha()
-    print(f"git_sha:        {sha}", flush=True)
-    print(f"include_seed:   {args.include_seed}", flush=True)
-    print(f"use_cache:      {not args.no_cache}", flush=True)
-    print(f"limit:          {args.limit or 'no limit'}", flush=True)
+    print(f"git_sha:           {sha}", flush=True)
+    print(f"include_seed:      {args.include_seed}", flush=True)
+    print(f"use_cache:         {not args.no_cache}", flush=True)
+    print(f"limit:             {args.limit or 'no limit'}", flush=True)
+    print(f"embeddings input:  {args.embeddings_artifact}", flush=True)
+    print(f"splits input:      {args.splits_artifact}", flush=True)
     print(flush=True)
 
-    # 1. Cargar originales (2590 con folds intactos)
-    print("Cargando originales (embeddings.parquet + splits.parquet)...",
-          flush=True)
-    df_orig = load_originals()
+    # 1. Cargar originales (2590 con folds intactos) desde W&B Artifacts
+    print("Cargando originales desde W&B Artifacts...", flush=True)
+    df_orig, input_artifacts = load_originals(
+        args.embeddings_artifact, args.splits_artifact,
+    )
     print(f"  filas originales: {len(df_orig)}")
     print(f"  especies (sera el set valido): {len(VALID_SPECIES_20)}")
     print()
@@ -675,7 +752,10 @@ def main() -> int:
         }
         print(f"\nSubiendo a W&B como artifact 'embeddings_retrain:{alias}'...",
               flush=True)
-        upload_to_wandb(out_path, metadata, alias)
+        # Pasar input_artifacts para que el run upload declare use_artifact()
+        # sobre los inputs concretos (lineage automatico).
+        metadata["input_artifacts"] = input_artifacts
+        upload_to_wandb(out_path, metadata, alias, input_artifacts)
 
     return 0
 
