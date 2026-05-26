@@ -131,7 +131,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--candidate-ckpt", type=Path, required=True,
                    help="Path al .ckpt del candidato (output de train.py).")
     p.add_argument("--prod-ckpt", type=Path, default=None,
-                   help="Path al .ckpt de prod. Default: wa-drop3-v1.")
+                   help="Path al .ckpt de prod (override local). Si no se pasa, "
+                        "se descarga desde --prod-artifact (W&B).")
+    p.add_argument("--prod-artifact", type=str, default="model_baseline:wa-drop3",
+                   help="W&B artifact name:alias del modelo en prod. Default "
+                        "'model_baseline:wa-drop3' apunta a wa-drop3-v1. "
+                        "Ignorado si --prod-ckpt se pasa explicito.")
     p.add_argument("--dataset", type=Path, required=True,
                    help="Parquet self-contained con fold=test_hard (D20).")
     p.add_argument("--output", type=Path, default=None,
@@ -149,18 +154,49 @@ def parse_args() -> argparse.Namespace:
 # Model loading + inference
 # ---------------------------------------------------------------------------
 
-def resolve_prod_ckpt(arg: Path | None) -> Path:
+def resolve_prod_ckpt(arg: Path | None, prod_artifact: str = "model_baseline:wa-drop3") -> Path:
+    """Resuelve el path al .ckpt de prod.
+
+    Prioridad:
+      1. ``--prod-ckpt`` explicito (debe existir en disco).
+      2. Glob local ``checkpoints/wa-drop3-v1/best-*.ckpt`` (dev local).
+      3. Descarga desde W&B Artifact ``prod_artifact`` (CI runner).
+
+    CI workflow va por el path #3 (disco limpio sin checkpoints/). Dev
+    local va por #2 (cache de entrenamiento previo).
+    """
     if arg is not None:
         if not arg.exists():
             raise FileNotFoundError(f"prod-ckpt no existe: {arg}")
         return arg
+
     matches = sorted(glob(DEFAULT_PROD_GLOB))
-    if not matches:
-        raise FileNotFoundError(
-            f"No encuentro prod ckpt default: {DEFAULT_PROD_GLOB}. "
-            "Pasa --prod-ckpt explicito."
+    if matches:
+        return Path(matches[-1])
+
+    # Fallback: descargar desde W&B
+    import os
+    import wandb
+    entity = os.environ.get("WANDB_ENTITY", "").strip()
+    project = os.environ.get("WANDB_PROJECT", "").strip()
+    if not entity or not project:
+        raise RuntimeError(
+            "No hay prod ckpt local (checkpoints/wa-drop3-v1/) y WANDB_ENTITY"
+            "/PROJECT no estan en env. Pasa --prod-ckpt o configura W&B."
         )
-    return Path(matches[-1])  # mas reciente alfabeticamente
+    print(f"  Descargando {prod_artifact} desde W&B...")
+    api = wandb.Api()
+    art = api.artifact(f"{entity}/{project}/{prod_artifact}", type="model")
+    art_dir = Path(art.download())
+    # El upload one-shot lo guarda como 'best.ckpt'
+    ckpt_files = list(art_dir.glob("*.ckpt"))
+    if not ckpt_files:
+        raise RuntimeError(
+            f"No hay .ckpt files en {art_dir}. Files: "
+            f"{[f.name for f in art_dir.iterdir()]}"
+        )
+    print(f"  Resolved prod ckpt: {ckpt_files[0]} (artifact {art.name})")
+    return ckpt_files[0]
 
 
 def load_classifier(ckpt: Path) -> BirdClassifier:
@@ -365,7 +401,7 @@ def main() -> int:
             print(f"! Candidate ckpt no existe: {candidate_ckpt}", file=sys.stderr)
             return 1
         candidate_ckpt = Path(matches[-1])
-    prod_ckpt = resolve_prod_ckpt(args.prod_ckpt)
+    prod_ckpt = resolve_prod_ckpt(args.prod_ckpt, args.prod_artifact)
     dataset = args.dataset
     if not dataset.exists():
         print(f"! Dataset no existe: {dataset}", file=sys.stderr)

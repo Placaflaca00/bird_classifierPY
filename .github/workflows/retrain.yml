@@ -294,12 +294,8 @@ jobs:
           CKPT=$(ls checkpoints/retrain-*/best-*.ckpt | head -1)
           RUN_NAME=$(basename "$(dirname "$CKPT")")
           DATASET=$(ls data/processed/embeddings_retrain_*.parquet | head -1)
-          # NOTA: prod-ckpt es checkpoints/wa-drop3-v1/best-*.ckpt. NO viene
-          # del artifact (es del repo, commiteado). Verificar que existe.
-          if ! ls checkpoints/wa-drop3-v1/best-*.ckpt >/dev/null 2>&1; then
-            echo "::error::Falta prod-ckpt checkpoints/wa-drop3-v1/best-*.ckpt en el repo."
-            exit 1
-          fi
+          # prod ckpt se descarga desde W&B Artifact model_baseline:wa-drop3
+          # automaticamente por evaluate.py (no esta en el repo, gitignored).
           python -u scripts/evaluate.py \
             --candidate-ckpt "$CKPT" \
             --dataset "$DATASET" \
