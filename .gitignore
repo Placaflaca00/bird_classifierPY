@@ -151,6 +151,9 @@ node_modules/
 
 # ML / Data
 wandb/
+# W&B Artifacts download dir (creado por wandb.Api().artifact().download()).
+# Cache local de artifacts versionados, regenerable.
+artifacts/
 lightning_logs/
 mlruns/
 *.ckpt
