@@ -15,6 +15,18 @@
       ]
     },
     {
+      "Sid": "ReadTrainingRuns",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:Query",
+        "dynamodb:GetItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-training-runs",
+        "arn:aws:dynamodb:us-east-1:863518416901:table/bird-classifier-py-training-runs/index/*"
+      ]
+    },
+    {
       "Sid": "UpdateOnlyReviewFields",
       "Effect": "Allow",
       "Action": "dynamodb:UpdateItem",
