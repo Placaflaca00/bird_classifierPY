@@ -1,0 +1,29 @@
+# Placeholder Fase 6.6.a — el rollback workflow real vive en
+# feature/rollback-workflow hasta cerrar E2E. Sin esto, GH Actions UI
+# no muestra "Run workflow" en main (workflow_dispatch requiere file
+# en default branch). El placeholder es no-op (if: false) — al
+# disparar workflow_dispatch desde feature/rollback-workflow, GH usa
+# el contenido REAL de esa branch, no este placeholder. Cuando E2E
+# pase, merge a main sobreescribe este archivo.
+
+name: Rollback Lambda (Fase 6.6) [placeholder]
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_uri:
+        description: 'ECR image URI completa (<repo>@sha256:...) o tag (<repo>:tag)'
+        required: true
+        type: string
+      reason:
+        description: 'Por que el rollback (audit log)'
+        required: false
+        type: string
+        default: 'manual via workflow_dispatch'
+
+jobs:
+  placeholder:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Real rollback.yml en feature/rollback-workflow"
