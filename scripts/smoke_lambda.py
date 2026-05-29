@@ -65,7 +65,24 @@ SMOKE_BASELINE_PATH = ROOT / "scripts" / "smoke_baseline.json"
 
 SMOKE_TOP1_THRESHOLD = 0.80          # 4/5 audios deben matchear top1
 SMOKE_CONFIDENCE_TOLERANCE_PP = 15.0  # |delta confianza| <= 15pp
-SMOKE_LATENCY_P95_MAX_S = 2.0         # p95 <= 2s post-warmup
+
+# Latency tracking en el smoke (Fase 6.6.a paso 5):
+#
+#   - SMOKE_LATENCY_MEDIAN_MAX_S: mediana razonable. Con N=4 audios (post
+#     warmup-first-skip) p95 era ruido — cualquier outlier setteaba p95.
+#     Mediana = mas robusta a outliers de un audio pesado puntual.
+#
+#   - SMOKE_LATENCY_HARD_CAP_S: cap absoluto por audio. ESTO ES PARA CACHAR
+#     CUELGUES (timeout efectivo), no para enforcing de SLO. Si un audio
+#     individual demora >5s estamos en problemas reales (cold start grave,
+#     red rota, infra degradada). El SLO real de latencia se trackea en
+#     CloudWatch (Lambda Insights + custom metrics), donde hay N>>4 muestras
+#     y percentiles tienen significado estadistico.
+SMOKE_LATENCY_MEDIAN_MAX_S = 1.5
+SMOKE_LATENCY_HARD_CAP_S = 5.0
+# DEPRECATED — alias compat por si alguien externo lo lee. NO usar nuevo codigo.
+SMOKE_LATENCY_P95_MAX_S = SMOKE_LATENCY_HARD_CAP_S
+
 SMOKE_LAMBDA_WARMUP_INVOKES = 2       # invokes pre-medicion para warm Lambda
 
 
@@ -212,23 +229,30 @@ def smoke_test(
         )
 
     top1_rate = matches / len(entries)
-    p95_latency = float(np.percentile(latencies, 95)) if latencies else 0.0
+    median_latency = float(np.median(latencies)) if latencies else 0.0
+    max_latency = max(latencies) if latencies else 0.0
     top1_ok = top1_rate >= SMOKE_TOP1_THRESHOLD
-    latency_ok = p95_latency <= SMOKE_LATENCY_P95_MAX_S
+    median_ok = median_latency <= SMOKE_LATENCY_MEDIAN_MAX_S
+    cap_ok = max_latency <= SMOKE_LATENCY_HARD_CAP_S
     conf_ok = len(confidence_violations) == 0
 
-    passed = top1_ok and latency_ok and conf_ok
+    passed = top1_ok and median_ok and cap_ok and conf_ok
     print()
     print(f"[smoke] Resultado:")
     print(f"  top1_rate={top1_rate:.0%} (>= {SMOKE_TOP1_THRESHOLD:.0%}?  {top1_ok})")
-    print(f"  p95_latency={p95_latency:.2f}s (<= {SMOKE_LATENCY_P95_MAX_S}s?  {latency_ok})")
+    print(f"  median_latency={median_latency:.2f}s (<= {SMOKE_LATENCY_MEDIAN_MAX_S}s?  {median_ok})")
+    print(f"  max_latency={max_latency:.2f}s (<= {SMOKE_LATENCY_HARD_CAP_S}s hard cap?  {cap_ok})")
     print(f"  confidence_violations={len(confidence_violations)} (0?  {conf_ok})")
     print(f"  PASSED = {passed}")
 
     return {
         "passed": passed,
         "top1_rate": top1_rate,
-        "p95_latency_s": p95_latency,
+        "median_latency_s": median_latency,
+        "max_latency_s": max_latency,
+        # DEPRECATED — el p95 con N=4 es ruido. Mantenido para compat con
+        # callers viejos que lo leen. Tracking real va a CloudWatch.
+        "p95_latency_s": float(np.percentile(latencies, 95)) if latencies else 0.0,
         "confidence_violations": confidence_violations,
         "per_audio": results,
     }

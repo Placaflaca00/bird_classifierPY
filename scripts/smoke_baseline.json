@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-25T20:13:57Z",
+  "generated_at": "2026-05-29T01:00:53Z",
   "tolerances": {
     "min_top1_match_rate": 0.8,
     "confidence_tolerance_pp": 15.0,
@@ -24,7 +24,7 @@
       "audio_path": "data/raw/columba_livia/GBIF2243550468.mp3",
       "species_dir": "columba_livia",
       "expected_top1_species": "Columba livia",
-      "expected_top1_confidence": 0.9752408266067505,
+      "expected_top1_confidence": 0.9761907458305359,
       "generated_against_checkpoint": "C:\\Users\\moha2\\Documents\\birdClassifier\\checkpoints\\wa-drop3-v1\\best-epoch=12-val_macro_f1=0.909.ckpt"
     },
     {

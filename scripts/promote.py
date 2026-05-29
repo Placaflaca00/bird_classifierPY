@@ -584,15 +584,42 @@ def generate_baseline() -> None:
     idx_to_species = {int(k): v for k, v in sidecar["idx_to_species"].items()}
 
     # Reusar pipeline de extraccion de embeddings desde audios
-    from scripts.precompute_embeddings import build_interpreter, embed_waveform, load_waveform
+    from scripts.precompute_embeddings import build_interpreter, embed_waveform
+
+    # Decoder COMPARTIDO con Lambda — Fase 6.6.a paso 5. Antes usabamos
+    # load_waveform(path) de precompute_embeddings, que via librosa+audioread
+    # podia decodificar audios que Lambda (BytesIO+soundfile sin audioread)
+    # rechazaba. Resultado: entries falsos-exitosos en el baseline que
+    # daban MISS deterministico en smoke_test contra prod sin ser regresion.
+    # Ahora ambos paths comparten la misma funcion; cualquier audio que
+    # Lambda no decodifique tampoco entra al baseline (falla aca con error
+    # ruidoso explicito, perfecto: el baseline es reproducible-by-construction).
+    sys.path.insert(0, str(ROOT / "lambda"))
+    from audio_io import decode_audio_bytes  # noqa: E402
 
     interpreter, input_idx, emb_idx = build_interpreter()
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
     audios = _select_baseline_audios()
     baseline_entries = []
+    skipped_undecodable = []
     for audio_path in audios:
-        y = load_waveform(audio_path)
+        try:
+            y = decode_audio_bytes(audio_path.read_bytes())
+        except Exception as e:  # noqa: BLE001
+            # No enmascarar: log explicito + skip. El operador ve cual fixture
+            # rechaza libsndfile y debe arreglarlo (re-encodear a WAV/MP3-CBR
+            # limpio) antes de regenerar baseline.
+            print(
+                f"  ! SKIP {audio_path.name}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            skipped_undecodable.append({
+                "audio_path": str(audio_path.relative_to(ROOT).as_posix()),
+                "error": f"{type(e).__name__}: {e}",
+            })
+            continue
         emb = embed_waveform(y, interpreter, input_idx, emb_idx).reshape(1, -1).astype(np.float32)
         logits = sess.run(["logits"], {"embedding": emb})[0]
         # Softmax para confidence
@@ -608,6 +635,17 @@ def generate_baseline() -> None:
         })
         print(f"  {audio_path.name}: top1={idx_to_species[top1_idx]} "
               f"conf={probs[top1_idx]:.4f}")
+
+    if skipped_undecodable:
+        print(
+            f"\n! WARNING: {len(skipped_undecodable)} fixture(s) skipped "
+            "por no ser decodificables por libsndfile/soundfile. "
+            "Re-encodear offline (ffmpeg -i in.mp3 -c:a libmp3lame -b:a 128k -ar 48000 out.mp3) "
+            "y re-correr --generate-baseline.",
+            file=sys.stderr,
+        )
+        for s in skipped_undecodable:
+            print(f"    - {s['audio_path']}: {s['error']}", file=sys.stderr)
 
     blob = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),

@@ -484,13 +484,19 @@ def _classify(embedding: np.ndarray, top_k: int) -> list[dict[str, Any]]:
 
 
 def _load_audio_bytes(audio_bytes: bytes) -> np.ndarray:
-    """Bytes -> waveform mono 48 kHz."""
-    import librosa
+    """Bytes -> waveform mono 48 kHz.
 
-    y, _ = librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE, mono=True)
+    Delega al modulo compartido ``audio_io`` (Fase 6.6.a) para que el
+    decoder de prod sea identico al de baseline-gen. Sin esa garantia,
+    smoke baseline puede aceptar audios que Lambda rechaza, generando
+    MISS deterministico en smoke_test sin que sea regresion real.
+    """
+    from audio_io import decode_audio_bytes
+
+    y = decode_audio_bytes(audio_bytes, sr=SAMPLE_RATE)
     if len(y) == 0:
         raise ValueError("audio vacío después de decodificar")
-    return y.astype(np.float32)
+    return y
 
 
 def _classify_synthetic(y: np.ndarray) -> str | None:

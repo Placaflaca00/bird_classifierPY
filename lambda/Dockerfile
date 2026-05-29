@@ -35,8 +35,8 @@ RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
 # Si esto falla, la imagen no se construye -> evitamos sorpresas en runtime.
 RUN python -c "import soundfile as sf; v = sf.__libsndfile_version__; print(f'libsndfile bundled: {v}'); assert tuple(int(x) for x in v.split('.')[:2]) >= (1, 1), f'libsndfile {v} sin soporte MP3 (necesita 1.1.0+)'"
 
-# Handler + metadata de especies (~3 KB)
-COPY handler.py species_metadata.json ${LAMBDA_TASK_ROOT}/
+# Handler + decoder compartido (Fase 6.6.a) + metadata de especies (~3 KB)
+COPY handler.py audio_io.py species_metadata.json ${LAMBDA_TASK_ROOT}/
 
 # Modelos: BirdNET TFLite (~50 MB) + classifier ONNX (1.2 MB) + sidecar JSON (~1 KB).
 # Total ~51 MB, muy por debajo del límite de 10 GB de Lambda container.
