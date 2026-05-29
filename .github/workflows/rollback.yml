@@ -1,0 +1,408 @@
+# Workflow Fase 6.6.a — rollback Lambda a un image_uri historico de ECR.
+#
+# Filosofia (vs retrain.yml/promote):
+#
+#   - NO re-buildea Docker. NO descarga ckpt de W&B. NO entrena nada.
+#     Solo re-apunta Lambda al image_uri (digest) que el operador eligio.
+#     Razon: rollback debe tardar segundos, no minutos. Re-buildear puede
+#     producir imagen DISTINTA (deps drift, base image rotada) y perderia
+#     la garantia de "vuelvo exactamente a lo que funcionaba".
+#
+#   - smoke_lambda.py corre DESPUES del re-deploy pero es REPORTE, no
+#     gate. El operador YA decidio rollback (click humano informado en
+#     la UI). Si smoke falla por el bug del baseline o por audios pesados,
+#     NO meta-rollbackeamos — eso generaria el loop "rollback al rollback
+#     al rollback" si el estado actual ES el roto. El resultado del smoke
+#     se persiste en DDB como ``post_rollback_smoke_passed`` y la UI lo
+#     muestra como warning, no como falla del rollback.
+#
+#   - El UNICO escenario que dispara meta-rollback es infra failure DURANTE
+#     el flow: Lambda no llega a State=Active en N segundos despues del
+#     update-function-code. Eso es "el deploy mismo se cayo" y ahi si
+#     queremos volver al digest previo capturado al inicio.
+#
+# Triggers:
+#   - workflow_dispatch (manual desde GH UI con input image_uri)
+#   - repository_dispatch (event_type=rollback, payload.image_uri desde
+#     el boton "↩ Rollback" del tab Training de 6.6.c)
+#
+# IAM:
+#   bird-retrain-ci-role (mismo rol que retrain.yml). Permisos ya
+#   verificados: lambda:UpdateFunctionCode + lambda:GetFunction +
+#   lambda:InvokeFunction + ecr:DescribeImages +
+#   dynamodb:PutItem/UpdateItem sobre bird-classifier-py-training-runs.
+
+name: Rollback Lambda (Fase 6.6)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_uri:
+        description: 'ECR image URI completa (<repo>@sha256:...) o tag (<repo>:tag)'
+        required: true
+        type: string
+      reason:
+        description: 'Por que el rollback (audit log)'
+        required: false
+        type: string
+        default: 'manual via workflow_dispatch'
+  repository_dispatch:
+    types: [rollback]
+
+permissions:
+  id-token: write       # OIDC sts:AssumeRoleWithWebIdentity
+  contents: read        # actions/checkout
+
+concurrency:
+  # Group COMPARTIDO con cualquier otro workflow/job que mute Lambda
+  # (retrain.yml job `promote` tiene job-level concurrency con la misma
+  # key). Sin esto, dos updates concurrentes a la misma funcion fallan
+  # con ResourceConflictException porque Lambda rechaza updates con
+  # LastUpdateStatus=InProgress. Sin ref qualifier — el lock es global
+  # a la funcion Lambda, no per-branch.
+  # cancel-in-progress=false: un rollback en curso NO debe matarse.
+  group: lambda-update-bird-classifier-py-inference
+  cancel-in-progress: false
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::863518416901:role/bird-retrain-ci-role
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.12'
+  DDB_TRAINING_RUNS_TABLE: bird-classifier-py-training-runs
+  LAMBDA_FUNCTION_NAME: bird-classifier-py-inference
+  LAMBDA_ACTIVE_TIMEOUT_S: '300'   # 5 min para que Lambda llegue a Active
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Job 1 — start: crea item RUN# en DDB con status=running, triggered_via=rollback.
+  # Capturamos el target_image_uri y triggered_by en el item desde el inicio
+  # para que la UI lo muestre "rollback en curso a vN" en vez de "running"
+  # ambiguo.
+  # ---------------------------------------------------------------------------
+  start:
+    name: 'Job 1: start (init DDB)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_id: ${{ steps.gen.outputs.run_id }}
+      target_image_uri: ${{ steps.gen.outputs.target_image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install minimal deps for notify
+        run: pip install boto3 python-dotenv
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: gen
+        name: Generate run_id + register in DDB
+        run: |
+          set -euo pipefail
+          RUN_ID=$(python -c "import uuid; print(uuid.uuid4())")
+          # image_uri prioriza workflow_dispatch input; fallback a payload
+          TARGET="${{ inputs.image_uri || github.event.client_payload.image_uri }}"
+          REASON="${{ inputs.reason || github.event.client_payload.reason || 'no reason provided' }}"
+          TRIGGERED_BY="${{ github.event.client_payload.triggered_by || github.actor }}"
+          TRIGGERED_VIA="${{ github.event_name }}"
+
+          if [ -z "$TARGET" ]; then
+            echo "::error::image_uri es requerido (inputs.image_uri o client_payload.image_uri)"
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "target_image_uri=$TARGET" >> "$GITHUB_OUTPUT"
+
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action create \
+            --status running --current-job start \
+            --field "triggered_by=$TRIGGERED_BY" \
+            --field "triggered_via=$TRIGGERED_VIA" \
+            --field "github_run_id=${{ github.run_id }}" \
+            --field "github_run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --field "git_sha=${{ github.sha }}" \
+            --field "rollback_target_image_uri=$TARGET" \
+            --field "rollback_reason=$REASON"
+
+          echo "run_id=$RUN_ID target=$TARGET"
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — rollback: el corazon. Validar target -> capturar prev -> update
+  # Lambda -> poll Active (con meta-rollback en timeout) -> smoke (reporte).
+  #
+  # Environment "production" igual que retrain.promote para que el manual
+  # gate sea consistente. Quien aprueba el promote tambien aprueba rollback.
+  # En la UI de 6.6.c, este gate es lo que el admin "abre" cuando clickea
+  # "Aprobar rollback" (mismo approve_pending_deployment via API).
+  # ---------------------------------------------------------------------------
+  rollback:
+    name: 'Job 2: rollback Lambda'
+    needs: start
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      RUN_ID: ${{ needs.start.outputs.run_id }}
+      TARGET_IMAGE_URI: ${{ needs.start.outputs.target_image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install deps (boto3 + smoke requirements)
+        run: |
+          pip install boto3 python-dotenv
+          # smoke_lambda.py necesita librosa+soundfile+numpy
+          pip install librosa soundfile numpy
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Notify start of rollback
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job rollback --status running
+
+      # Step 1: validar que el digest target existe en ECR + resolver a
+      # forma canonica @sha256:... (necesario para el digest check post-poll).
+      #
+      # Si el operador paso un tag (...:fase5b-retention), ECR resuelve tag
+      # -> digest y exportamos el URI canonico. Si ya paso @sha256:..., el
+      # canonico es identico al input. Ambos casos producen la misma forma
+      # comparable contra ResolvedImageUri del get-function post-update.
+      - id: validate-target
+        name: Validate target image exists in ECR + resolve to canonical digest URI
+        run: |
+          set -euo pipefail
+          echo "Target: $TARGET_IMAGE_URI"
+          # Extraer @digest o :tag del URI completo
+          if [[ "$TARGET_IMAGE_URI" == *"@sha256:"* ]]; then
+            DIGEST="${TARGET_IMAGE_URI##*@}"
+            REPO_PREFIX="${TARGET_IMAGE_URI%@*}"
+            echo "Validando digest: $DIGEST"
+            aws ecr describe-images \
+              --repository-name bird-classifier-py \
+              --image-ids imageDigest="$DIGEST" \
+              --query 'imageDetails[0].{digest:imageDigest,tags:imageTags,pushed:imagePushedAt}' \
+              --output json
+          else
+            TAG="${TARGET_IMAGE_URI##*:}"
+            REPO_PREFIX="${TARGET_IMAGE_URI%:*}"
+            echo "Validando tag: $TAG"
+            DIGEST=$(aws ecr describe-images \
+              --repository-name bird-classifier-py \
+              --image-ids imageTag="$TAG" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)
+            aws ecr describe-images \
+              --repository-name bird-classifier-py \
+              --image-ids imageTag="$TAG" \
+              --query 'imageDetails[0].{digest:imageDigest,tags:imageTags,pushed:imagePushedAt}' \
+              --output json
+          fi
+          # Forma canonica para el digest check del paso siguiente.
+          # ResolvedImageUri de get-function devuelve <account>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:<digest>
+          # — mismo formato que armamos aca.
+          CANONICAL_URI="${REPO_PREFIX}@${DIGEST}"
+          echo "Canonical URI: $CANONICAL_URI"
+          echo "target_canonical_uri=$CANONICAL_URI" >> "$GITHUB_OUTPUT"
+          echo "target_digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      # Step 2: capturar el image_uri ACTUAL del Lambda. Lo persistimos
+      # en DDB (previous_image_uri) para audit log + UI history. NO se usa
+      # para meta-rollback: si el update fall, Lambda mantiene el codigo
+      # previo corriendo solo (no hay nada util a lo que "re-apuntar").
+      - id: capture-prev
+        name: Capture current Lambda image_uri (audit log)
+        run: |
+          set -euo pipefail
+          PREV=$(aws lambda get-function \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --query 'Code.ImageUri' --output text)
+          echo "Previous image_uri: $PREV"
+          echo "previous_image_uri=$PREV" >> "$GITHUB_OUTPUT"
+
+      # Step 3: el rollback efectivo. update-function-code es asincrono;
+      # vuelve inmediato con LastUpdateStatus=InProgress. El poll de
+      # Successful esta en el step siguiente.
+      - name: Update Lambda code (re-point digest)
+        run: |
+          set -euo pipefail
+          aws lambda update-function-code \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --image-uri "$TARGET_IMAGE_URI" \
+            --query '{state:State,lastStatus:LastUpdateStatus}' \
+            --output json
+
+      # Step 4: poll hasta State=Active Y LastUpdateStatus=Successful.
+      #
+      # Por que LastUpdateStatus (no solo State): durante un update el
+      # State queda Active TODO el tiempo, y si el update FALLA el State
+      # tambien sigue Active (Lambda mantiene el codigo previo corriendo).
+      # El unico signal confiable de exito/fallo del update es
+      # LastUpdateStatus: InProgress -> Successful | Failed.
+      #
+      # Sin meta-rollback: un update fallido NO destruye produccion, el
+      # codigo previo sigue sirviendo trafico. No hay nada productivo a
+      # lo que re-apuntar (re-apuntarse a si mismo es no-op). Failed =
+      # exit 1, finalize marca failed_critical.
+      - id: poll-status
+        name: Poll Lambda LastUpdateStatus until Successful (timeout 300s)
+        run: |
+          set -euo pipefail
+          START_TS=$(date +%s)
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_TS))
+            if [ "$ELAPSED" -ge "$LAMBDA_ACTIVE_TIMEOUT_S" ]; then
+              echo "::error::Lambda update no completo en ${LAMBDA_ACTIVE_TIMEOUT_S}s (LastUpdateStatus sigue InProgress)"
+              echo "Codigo previo sigue corriendo (no meta-rollback necesario)"
+              exit 1
+            fi
+            # Un solo describe trae ambos campos -> 1 API call por iter
+            CFG=$(aws lambda get-function-configuration \
+              --function-name "$LAMBDA_FUNCTION_NAME" \
+              --query '{state:State,lastStatus:LastUpdateStatus,reason:LastUpdateStatusReason}' \
+              --output json)
+            STATE=$(echo "$CFG" | python -c "import sys,json; print(json.load(sys.stdin)['state'])")
+            LAST=$(echo "$CFG" | python -c "import sys,json; print(json.load(sys.stdin)['lastStatus'])")
+            echo "  t+${ELAPSED}s: State=$STATE LastUpdateStatus=$LAST"
+            if [ "$LAST" = "Successful" ] && [ "$STATE" = "Active" ]; then
+              echo "Lambda update OK (State=Active + LastUpdateStatus=Successful)"
+              break
+            fi
+            if [ "$LAST" = "Failed" ]; then
+              REASON=$(echo "$CFG" | python -c "import sys,json; print(json.load(sys.stdin).get('reason') or '<none>')")
+              echo "::error::Lambda LastUpdateStatus=Failed: $REASON"
+              echo "Codigo previo sigue corriendo (no meta-rollback necesario)"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      # Step 4.5: VERIFICAR que el digest live matchea el target.
+      #
+      # Por que esto va si o si despues del poll: LastUpdateStatus=Successful
+      # confirma que ALGUN update termino, no QUE imagen quedo. Y
+      # update-function-code es eventually consistent — el poll puede leer
+      # un Successful "viejo" mientras la API resuelve el nuevo. Esta
+      # verificacion contra ResolvedImageUri es la prueba real de aterrizaje
+      # y cierra el race en una.
+      #
+      # ResolvedImageUri viene de get-function (no get-function-configuration)
+      # bajo Code.ResolvedImageUri. Devuelve siempre @sha256:..., aunque al
+      # update se le haya pasado :tag — Lambda hace el tag->digest internamente.
+      - id: verify-resolved-digest
+        name: Verify Lambda ResolvedImageUri matches target digest
+        env:
+          TARGET_CANONICAL_URI: ${{ steps.validate-target.outputs.target_canonical_uri }}
+          TARGET_DIGEST: ${{ steps.validate-target.outputs.target_digest }}
+        run: |
+          set -euo pipefail
+          RESOLVED=$(aws lambda get-function \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
+            --query 'Code.ResolvedImageUri' --output text)
+          echo "Resolved live: $RESOLVED"
+          echo "Target:        $TARGET_CANONICAL_URI"
+          # Comparar por digest (suffix @sha256:...) — robusto contra
+          # diferencias triviales en el repo prefix.
+          RESOLVED_DIGEST="${RESOLVED##*@}"
+          if [ "$RESOLVED_DIGEST" != "$TARGET_DIGEST" ]; then
+            echo "::error::Digest mismatch tras update."
+            echo "  esperado: $TARGET_DIGEST"
+            echo "  vivo:     $RESOLVED_DIGEST"
+            echo "Lambda NO esta corriendo la imagen target. Codigo previo sigue activo."
+            exit 1
+          fi
+          echo "OK Lambda esta corriendo la imagen target ($TARGET_DIGEST)"
+
+      # Step 5: smoke test post-rollback. RESULTADO = REPORTE en DDB, NO gate.
+      # exit code del CLI smoke (0 PASS / 1 FAIL / 2 config) NO bloquea
+      # el workflow — capturamos en variable y persistimos.
+      - id: smoke
+        name: Run smoke_lambda.py post-rollback (reporte)
+        run: |
+          set +e   # NO -e: smoke fail no debe abortar
+          python scripts/smoke_lambda.py \
+            --output-json /tmp/smoke_result.json \
+            --function-name "$LAMBDA_FUNCTION_NAME"
+          SMOKE_EXIT=$?
+          set -e
+          if [ "$SMOKE_EXIT" -eq 0 ]; then
+            SMOKE_PASSED=true
+          else
+            SMOKE_PASSED=false
+          fi
+          echo "Smoke exit=$SMOKE_EXIT passed=$SMOKE_PASSED"
+          echo "smoke_passed=$SMOKE_PASSED" >> "$GITHUB_OUTPUT"
+          echo "smoke_exit=$SMOKE_EXIT" >> "$GITHUB_OUTPUT"
+
+      # Step 6: notify success — escribimos al item DDB el resultado completo.
+      # El status final viene del finalize job; aca solo es update intermedio.
+      - name: Notify rollback completed (con reporte smoke)
+        env:
+          PREV_URI: ${{ steps.capture-prev.outputs.previous_image_uri }}
+          SMOKE_PASSED: ${{ steps.smoke.outputs.smoke_passed }}
+        run: |
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action update --current-job rollback \
+            --field "ecr_image_uri=$TARGET_IMAGE_URI" \
+            --field "previous_image_uri=$PREV_URI" \
+            --field "post_rollback_smoke_passed=$SMOKE_PASSED"
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — finalize: status sticky. Corre siempre (if: always()).
+  # ---------------------------------------------------------------------------
+  finalize:
+    name: 'Job 3: finalize'
+    needs: [start, rollback]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      - name: Install deps
+        run: pip install boto3 python-dotenv
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Finalize status
+        env:
+          RUN_ID: ${{ needs.start.outputs.run_id }}
+          ROLLBACK_RESULT: ${{ needs.rollback.result }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RUN_ID" ]; then
+            # Edge case: start fallo antes de generar run_id. No hay item DDB.
+            echo "No RUN_ID — start job fallo antes del PutItem. Nada para finalizar."
+            exit 0
+          fi
+          # Mapeo result -> status final.
+          # NOTA: smoke FAIL NO mueve el status a failed_critical (es reporte).
+          # Solo el rollback EFECTIVO (lambda update + Active poll) define exito.
+          case "$ROLLBACK_RESULT" in
+            success)
+              FINAL_STATUS=rolled_back ;;
+            failure|cancelled|skipped)
+              FINAL_STATUS=failed_critical ;;
+            *)
+              FINAL_STATUS=failed_critical ;;
+          esac
+          echo "Finalizing run $RUN_ID -> status=$FINAL_STATUS (rollback job result: $ROLLBACK_RESULT)"
+          python scripts/notify_training_run.py \
+            --run-id "$RUN_ID" --action finalize \
+            --status "$FINAL_STATUS" --current-job done
