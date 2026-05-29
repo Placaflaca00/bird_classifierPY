@@ -92,11 +92,16 @@ SMOKE_LAMBDA_WARMUP_INVOKES = 2       # invokes pre-medicion para warm Lambda
 def _invoke_lambda_with_audio(
     lambda_client, audio_path: Path, fingerprint: str,
     function_name: str = LAMBDA_FUNCTION_NAME,
-) -> tuple[dict, float]:
+) -> tuple[int, dict, float]:
     """Invoke Lambda directo con audio_b64 (schema v1, sin S3).
 
     Returns:
-        (response_body_dict, latency_seconds)
+        (http_status_code, response_body_dict, latency_seconds)
+
+    http_status_code: el statusCode del payload de Lambda (200 happy,
+        400 decode, 429 rate-limited, 5xx server). Necesario para que el
+        caller distinga 429 (cuota agotada — el smoke no puede ejecutarse
+        contra la imagen, no es signal del modelo) de un fail real.
     """
     audio_bytes = audio_path.read_bytes()
     body = {
@@ -113,8 +118,9 @@ def _invoke_lambda_with_audio(
     )
     latency = time.time() - t0
     payload = json.loads(resp["Payload"].read())
+    http_status = int(payload.get("statusCode", 0))
     body_str = payload.get("body", "{}")
-    return json.loads(body_str), latency
+    return http_status, json.loads(body_str), latency
 
 
 def smoke_test(
@@ -177,18 +183,38 @@ def smoke_test(
     matches = 0
     confidence_violations = []
 
+    rate_limited_count = 0
+
     print(f"[smoke] Smoke contra {len(entries)} audios baseline...")
     for i, entry in enumerate(entries):
         audio_path = root / entry["audio_path"]
         if not audio_path.exists():
             raise FileNotFoundError(f"baseline audio missing: {audio_path}")
-        body, latency = _invoke_lambda_with_audio(
+        http_status, body, latency = _invoke_lambda_with_audio(
             lambda_client, audio_path, fingerprint,
             function_name=function_name,
         )
         # Excluir primer invoke de la p95 (cold path edge case)
         if i > 0:
             latencies.append(latency)
+
+        # Rate-limited: NO podemos ejercitar el modelo. NO contar como
+        # MISS, contar como confound separado y retornar exit 3 al
+        # final. Si TODOS son 429, claramente no podemos validar nada.
+        # Si solo algunos, el cap se agoto mid-run (caso raro pero posible).
+        if http_status == 429:
+            rate_limited_count += 1
+            results.append({
+                "audio": entry["audio_path"],
+                "rate_limited": True,
+                "http_status": 429,
+                "latency_s": latency,
+            })
+            print(
+                f"  [429] {entry['species_dir']:<25s} rate-limited "
+                f"(cuota del fingerprint smoke agotada) lat={latency:.2f}s"
+            )
+            continue
 
         predictions = body.get("predictions") or []
         if predictions:
@@ -227,6 +253,21 @@ def smoke_test(
             f"conf={actual_conf:.4f} (exp {expected_conf:.4f}) "
             f"lat={latency:.2f}s"
         )
+
+    # Rate limited: NO puede ejercitar el modelo. Reportar separado y NO
+    # como passed/failed (que sugerirían info del modelo). Caller usa
+    # exit code 3 distinto.
+    if rate_limited_count > 0:
+        print()
+        print(f"[smoke] Resultado:")
+        print(f"  rate_limited: {rate_limited_count}/{len(entries)} invocaciones")
+        print(f"  STATUS = rate_limited (no se pudo ejercitar el modelo)")
+        return {
+            "passed": False,
+            "rate_limited": True,
+            "rate_limited_count": rate_limited_count,
+            "per_audio": results,
+        }
 
     top1_rate = matches / len(entries)
     median_latency = float(np.median(latencies)) if latencies else 0.0
@@ -293,6 +334,16 @@ def main() -> int:
         args.output_json.write_text(json.dumps(result, indent=2))
         print(f"\n[smoke] Resultado escrito a {args.output_json}")
 
+    # Exit codes (rollback.yml mapea a smoke_status):
+    #   0 — passed: smoke supero todos los thresholds.
+    #   1 — failed: smoke corrio y NO supero algun threshold (signal real
+    #               del modelo deployado).
+    #   2 — config_error: baseline/audios missing (caught en except arriba).
+    #   3 — rate_limited: cuota del fingerprint smoke agotada. NO sabemos
+    #               nada del modelo. Distinto de failed para que el operador
+    #               no confunda "no pude correr por cuota" con "modelo malo".
+    if result.get("rate_limited"):
+        return 3
     return 0 if result["passed"] else 1
 
 
