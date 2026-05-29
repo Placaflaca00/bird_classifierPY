@@ -37,6 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -44,6 +48,31 @@ jobs:
 
       - id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
+
+      # Lambda/models esta gitignored:
+      #   - BirdNET TFLite ~50MB: viene bundled en birdnetlib package
+      #   - classifier.onnx ~1MB + classifier.json: staging en S3
+      #     (conocetuave-py-uploads/_infra/lambda_models/), rol ya tiene
+      #     s3:GetObject. Update manual desde local cuando se promueve
+      #     un modelo nuevo.
+      - name: Populate lambda/models/
+        run: |
+          set -euo pipefail
+          mkdir -p lambda/models
+          pip install birdnetlib
+          # 1) BirdNET TFLite desde birdnetlib package
+          python -c "
+          import birdnetlib, shutil
+          from pathlib import Path
+          src = Path(birdnetlib.__file__).parent / 'models' / 'analyzer' / 'BirdNET_GLOBAL_6K_V2.4_Model_FP32.tflite'
+          dst = Path('lambda/models/BirdNET_GLOBAL_6K_V2.4_Model_FP32.tflite')
+          shutil.copy2(src, dst)
+          print(f'BirdNET copied: {dst.stat().st_size / 1024 / 1024:.1f} MB')
+          "
+          # 2) Classifier ONNX + sidecar desde S3
+          aws s3 cp s3://conocetuave-py-uploads/_infra/lambda_models/classifier.onnx lambda/models/classifier.onnx
+          aws s3 cp s3://conocetuave-py-uploads/_infra/lambda_models/classifier.json lambda/models/classifier.json
+          ls -la lambda/models/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
