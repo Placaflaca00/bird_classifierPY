@@ -78,6 +78,7 @@ JOB_ORDER: dict[str, int] = {
     "train": 2,
     "evaluate": 3,
     "promote": 4,
+    "rollback": 4,        # mismo orden que promote — ambos son el step que muta Lambda
     "finalize": 5,
     "done": 5,            # alias de finalize
     # Terminal: cualquier valor superior es sticky (no se sobreescribe)
@@ -85,7 +86,10 @@ JOB_ORDER: dict[str, int] = {
 }
 
 # Status terminales (no se sobreescriben una vez seteados)
-TERMINAL_STATUSES = {"succeeded", "promoted", "rejected", "failed", "failed_critical"}
+TERMINAL_STATUSES = {
+    "succeeded", "promoted", "rejected", "rolled_back",
+    "failed", "failed_critical",
+}
 
 
 def parse_args() -> argparse.Namespace:
