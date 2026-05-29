@@ -549,10 +549,17 @@ def rollback_lambda(lambda_client, prev_image_uri: str) -> None:
 def _select_baseline_audios() -> list[Path]:
     """Selecciona 1 audio fijo por cada especie del baseline. Toma el primer
     archivo alfabeticamente para determinismo.
+
+    Path: scripts/smoke_audios/<species>/ (tracked en git, ~3MB total).
+    Movido desde data/raw/ en commit 6.6.a paso post-validacion. Razon:
+    data/raw/ esta gitignored -> CI runner no tiene los audios -> el
+    workflow rollback.yml tiraba 'baseline audio missing' (config_error,
+    exit 2 de smoke_lambda.py), generando smoke_passed=false vacuous en
+    DDB que no diferenciaba "smoke no pudo correr" de "smoke fallo".
     """
     selected: list[Path] = []
     for species_dir in SMOKE_BASELINE_AUDIOS:
-        d = ROOT / "data" / "raw" / species_dir
+        d = ROOT / "scripts" / "smoke_audios" / species_dir
         if not d.exists():
             raise FileNotFoundError(f"baseline audio dir missing: {d}")
         files = sorted(d.glob("*.mp3"))
@@ -584,15 +591,42 @@ def generate_baseline() -> None:
     idx_to_species = {int(k): v for k, v in sidecar["idx_to_species"].items()}
 
     # Reusar pipeline de extraccion de embeddings desde audios
-    from scripts.precompute_embeddings import build_interpreter, embed_waveform, load_waveform
+    from scripts.precompute_embeddings import build_interpreter, embed_waveform
+
+    # Decoder COMPARTIDO con Lambda — Fase 6.6.a paso 5. Antes usabamos
+    # load_waveform(path) de precompute_embeddings, que via librosa+audioread
+    # podia decodificar audios que Lambda (BytesIO+soundfile sin audioread)
+    # rechazaba. Resultado: entries falsos-exitosos en el baseline que
+    # daban MISS deterministico en smoke_test contra prod sin ser regresion.
+    # Ahora ambos paths comparten la misma funcion; cualquier audio que
+    # Lambda no decodifique tampoco entra al baseline (falla aca con error
+    # ruidoso explicito, perfecto: el baseline es reproducible-by-construction).
+    sys.path.insert(0, str(ROOT / "lambda"))
+    from audio_io import decode_audio_bytes  # noqa: E402
 
     interpreter, input_idx, emb_idx = build_interpreter()
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
 
     audios = _select_baseline_audios()
     baseline_entries = []
+    skipped_undecodable = []
     for audio_path in audios:
-        y = load_waveform(audio_path)
+        try:
+            y = decode_audio_bytes(audio_path.read_bytes())
+        except Exception as e:  # noqa: BLE001
+            # No enmascarar: log explicito + skip. El operador ve cual fixture
+            # rechaza libsndfile y debe arreglarlo (re-encodear a WAV/MP3-CBR
+            # limpio) antes de regenerar baseline.
+            print(
+                f"  ! SKIP {audio_path.name}: "
+                f"{type(e).__name__}: {e}",
+                file=sys.stderr,
+            )
+            skipped_undecodable.append({
+                "audio_path": str(audio_path.relative_to(ROOT).as_posix()),
+                "error": f"{type(e).__name__}: {e}",
+            })
+            continue
         emb = embed_waveform(y, interpreter, input_idx, emb_idx).reshape(1, -1).astype(np.float32)
         logits = sess.run(["logits"], {"embedding": emb})[0]
         # Softmax para confidence
@@ -609,6 +643,17 @@ def generate_baseline() -> None:
         print(f"  {audio_path.name}: top1={idx_to_species[top1_idx]} "
               f"conf={probs[top1_idx]:.4f}")
 
+    if skipped_undecodable:
+        print(
+            f"\n! WARNING: {len(skipped_undecodable)} fixture(s) skipped "
+            "por no ser decodificables por libsndfile/soundfile. "
+            "Re-encodear offline (ffmpeg -i in.mp3 -c:a libmp3lame -b:a 128k -ar 48000 out.mp3) "
+            "y re-correr --generate-baseline.",
+            file=sys.stderr,
+        )
+        for s in skipped_undecodable:
+            print(f"    - {s['audio_path']}: {s['error']}", file=sys.stderr)
+
     blob = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "tolerances": {
@@ -622,133 +667,22 @@ def generate_baseline() -> None:
     print(f"\nEscrito: {SMOKE_BASELINE_PATH}")
 
 
-def _invoke_lambda_with_audio(
-    lambda_client, audio_path: Path, fingerprint: str
-) -> tuple[dict, float]:
-    """Invoke Lambda directo con audio_b64 (v1 schema, sin S3).
-    Returns (response_body_dict, latency_seconds).
-    """
-    audio_bytes = audio_path.read_bytes()
-    body = {
-        "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
-        "fingerprint": fingerprint,
-        "top_k": 3,
-        "training_consent": False,
-    }
-    event = {"rawPath": "/predict", "body": json.dumps(body)}
-    t0 = time.time()
-    resp = lambda_client.invoke(
-        FunctionName=LAMBDA_FUNCTION_NAME,
-        Payload=json.dumps(event).encode("utf-8"),
-    )
-    latency = time.time() - t0
-    payload = json.loads(resp["Payload"].read())
-    body_str = payload.get("body", "{}")
-    return json.loads(body_str), latency
+# Smoke test extraido a scripts/smoke_lambda.py en Fase 6.6.a — usable por
+# rollback.yml sin tener que correr todo el flujo de promote. Mantenemos
+# el nombre stage4_smoke_test como re-export para no romper imports
+# internos ni el flow numbered de "Etapa N" del script.
+from scripts.smoke_lambda import smoke_test as _smoke_test_impl  # noqa: E402
 
 
 def stage4_smoke_test(lambda_client) -> dict[str, Any]:
     """Compara invocacion Lambda contra baseline persistido. Returns dict
     con detalle. ``passed`` field indica overall result.
+
+    Delega a ``scripts.smoke_lambda.smoke_test`` (refactor Fase 6.6.a). El
+    print prefix ``[smoke]`` viene del modulo extraido — no replicamos el
+    ``[Etapa 4]`` aca para no duplicar lineas. Equivalencia funcional 100%.
     """
-    if not SMOKE_BASELINE_PATH.exists():
-        raise FileNotFoundError(
-            f"{SMOKE_BASELINE_PATH} no existe. "
-            "Correr `python scripts/promote.py --generate-baseline` primero."
-        )
-    baseline = json.loads(SMOKE_BASELINE_PATH.read_text())
-    entries = baseline["entries"]
-
-    # Fingerprint stable identificable como smoke (32 hex post fp_)
-    fp_hash = hashlib.md5(b"smoke_test_promote").hexdigest()[:32]
-    fingerprint = f"fp_{fp_hash}"
-
-    # Warmup: 2 invocaciones para mitigar cold start antes de medir p95
-    print(f"[Etapa 4] Warmup ({SMOKE_LAMBDA_WARMUP_INVOKES} invokes)...")
-    for _ in range(SMOKE_LAMBDA_WARMUP_INVOKES):
-        try:
-            lambda_client.invoke(
-                FunctionName=LAMBDA_FUNCTION_NAME,
-                Payload=json.dumps({"warm": True}).encode("utf-8"),
-            )
-        except Exception:
-            pass
-
-    results = []
-    latencies = []
-    matches = 0
-    confidence_violations = []
-
-    print(f"[Etapa 4] Smoke contra {len(entries)} audios baseline...")
-    for i, entry in enumerate(entries):
-        audio_path = ROOT / entry["audio_path"]
-        if not audio_path.exists():
-            raise FileNotFoundError(f"baseline audio missing: {audio_path}")
-        body, latency = _invoke_lambda_with_audio(lambda_client, audio_path, fingerprint)
-        # Excluir primer invoke real de la p95 (audio decode path puede pagar
-        # cold-init de librosa/numba JIT que /warm no ejercita exactamente).
-        if i > 0:
-            latencies.append(latency)
-
-        # response shape REAL de _predict_response (handler.py:1196):
-        #   {"predictions": [{species, common_name, confidence}, ...]}
-        predictions = body.get("predictions") or []
-        if predictions:
-            actual_top1 = predictions[0].get("species")
-            actual_conf = float(predictions[0].get("confidence", 0.0))
-        else:
-            # Audio rechazado por capa 1/2 (not_a_bird, pure_tone, white_noise)
-            # o error del handler. Reportar reason si esta.
-            actual_top1 = body.get("reason") or "<no predictions>"
-            actual_conf = 0.0
-        expected_top1 = entry["expected_top1_species"]
-        expected_conf = entry["expected_top1_confidence"]
-        top1_match = (actual_top1 == expected_top1)
-        conf_diff_pp = abs((actual_conf - expected_conf) * 100)
-        conf_ok = conf_diff_pp <= SMOKE_CONFIDENCE_TOLERANCE_PP
-        if top1_match:
-            matches += 1
-        if not conf_ok:
-            confidence_violations.append({
-                "audio": entry["audio_path"],
-                "expected": expected_conf,
-                "actual": actual_conf,
-                "diff_pp": conf_diff_pp,
-            })
-
-        results.append({
-            "audio": entry["audio_path"],
-            "expected_top1": expected_top1, "actual_top1": actual_top1,
-            "top1_match": top1_match,
-            "expected_conf": expected_conf, "actual_conf": actual_conf,
-            "conf_diff_pp": conf_diff_pp,
-            "latency_s": latency,
-        })
-        tag = "OK" if top1_match else "MISS"
-        print(f"  [{tag}] {entry['species_dir']:<25s} top1={actual_top1} "
-              f"conf={actual_conf:.4f} (exp {expected_conf:.4f}) "
-              f"lat={latency:.2f}s")
-
-    top1_rate = matches / len(entries)
-    p95_latency = float(np.percentile(latencies, 95))
-    top1_ok = top1_rate >= SMOKE_TOP1_THRESHOLD
-    latency_ok = p95_latency <= SMOKE_LATENCY_P95_MAX_S
-    conf_ok = len(confidence_violations) == 0
-
-    passed = top1_ok and latency_ok and conf_ok
-    print(f"\n[Etapa 4] Resultado:")
-    print(f"  top1_rate={top1_rate:.0%} (>= {SMOKE_TOP1_THRESHOLD:.0%}?  {top1_ok})")
-    print(f"  p95_latency={p95_latency:.2f}s (<= {SMOKE_LATENCY_P95_MAX_S}s?  {latency_ok})")
-    print(f"  confidence_violations={len(confidence_violations)} (0?  {conf_ok})")
-    print(f"  PASSED = {passed}")
-
-    return {
-        "passed": passed,
-        "top1_rate": top1_rate,
-        "p95_latency_s": p95_latency,
-        "confidence_violations": confidence_violations,
-        "per_audio": results,
-    }
+    return _smoke_test_impl(lambda_client=lambda_client)
 
 
 # ---------------------------------------------------------------------------

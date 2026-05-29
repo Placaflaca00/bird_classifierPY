@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-25T20:13:57Z",
+  "generated_at": "2026-05-29T11:17:25Z",
   "tolerances": {
     "min_top1_match_rate": 0.8,
     "confidence_tolerance_pp": 15.0,
@@ -7,35 +7,35 @@
   },
   "entries": [
     {
-      "audio_path": "data/raw/chauna_torquata/GBIF2243554816.mp3",
+      "audio_path": "scripts/smoke_audios/chauna_torquata/GBIF2243554816.mp3",
       "species_dir": "chauna_torquata",
       "expected_top1_species": "Chauna torquata",
       "expected_top1_confidence": 0.9997891783714294,
       "generated_against_checkpoint": "C:\\Users\\moha2\\Documents\\birdClassifier\\checkpoints\\wa-drop3-v1\\best-epoch=12-val_macro_f1=0.909.ckpt"
     },
     {
-      "audio_path": "data/raw/ramphastos_toco/GBIF2243560078.mp3",
+      "audio_path": "scripts/smoke_audios/ramphastos_toco/GBIF2243560078.mp3",
       "species_dir": "ramphastos_toco",
       "expected_top1_species": "Ramphastos toco",
       "expected_top1_confidence": 0.9999853372573853,
       "generated_against_checkpoint": "C:\\Users\\moha2\\Documents\\birdClassifier\\checkpoints\\wa-drop3-v1\\best-epoch=12-val_macro_f1=0.909.ckpt"
     },
     {
-      "audio_path": "data/raw/columba_livia/GBIF2243550468.mp3",
+      "audio_path": "scripts/smoke_audios/columba_livia/GBIF2243550468.mp3",
       "species_dir": "columba_livia",
       "expected_top1_species": "Columba livia",
-      "expected_top1_confidence": 0.9752408266067505,
+      "expected_top1_confidence": 0.9761907458305359,
       "generated_against_checkpoint": "C:\\Users\\moha2\\Documents\\birdClassifier\\checkpoints\\wa-drop3-v1\\best-epoch=12-val_macro_f1=0.909.ckpt"
     },
     {
-      "audio_path": "data/raw/jabiru_mycteria/GBIF2243559813.mp3",
+      "audio_path": "scripts/smoke_audios/jabiru_mycteria/GBIF2243559813.mp3",
       "species_dir": "jabiru_mycteria",
       "expected_top1_species": "Jabiru mycteria",
       "expected_top1_confidence": 0.8456743955612183,
       "generated_against_checkpoint": "C:\\Users\\moha2\\Documents\\birdClassifier\\checkpoints\\wa-drop3-v1\\best-epoch=12-val_macro_f1=0.909.ckpt"
     },
     {
-      "audio_path": "data/raw/rhea_americana/GBIF2243614875.mp3",
+      "audio_path": "scripts/smoke_audios/rhea_americana/GBIF2243614875.mp3",
       "species_dir": "rhea_americana",
       "expected_top1_species": "Rhea americana",
       "expected_top1_confidence": 0.6510246992111206,

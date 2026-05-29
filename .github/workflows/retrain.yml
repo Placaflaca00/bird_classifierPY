@@ -349,6 +349,13 @@ jobs:
     if: needs.evaluate.outputs.should_promote == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Concurrency compartida con rollback.yml (Fase 6.6.a): cualquier
+    # workflow que mute Lambda toma el mismo lock para evitar
+    # ResourceConflictException (Lambda rechaza updates con
+    # LastUpdateStatus=InProgress).
+    concurrency:
+      group: lambda-update-bird-classifier-py-inference
+      cancel-in-progress: false
     environment: production       # SETUP MANUAL: GH Settings -> Environments -> production
                                   # - Required reviewer: Placaflaca00
                                   # - Wait timer: 1 min (lectura de reporte evaluate)
