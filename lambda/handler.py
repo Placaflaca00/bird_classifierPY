@@ -623,6 +623,47 @@ def _read_audio_from_s3(s3_key: str) -> bytes:
 # ---------------------------------------------------------------------------
 # Fase 4: DynamoDB writes (rate limit + prediction logging)
 # ---------------------------------------------------------------------------
+# Marker top-level del event que indica invoke de infra confiable (smoke,
+# healthcheck, futuros tools internos). NO se setea desde el publico via
+# API Gateway: HTTP API payload v2.0 tiene shape de keys cerrada
+# (version, routeKey, rawPath, rawQueryString, cookies, headers,
+# queryStringParameters, requestContext, body, pathParameters,
+# isBase64Encoded, stageVariables) — el cliente solo controla body/query/
+# headers DENTRO de su key, no como siblings top-level. Solo callers de
+# boto3 lambda.invoke() directos (que requieren IAM lambda:InvokeFunction
+# sobre el ARN del Lambda) pueden setearlo.
+_INFRA_MARKER_KEY = "_infrastructure_invoke"
+
+
+def _is_infra_invoke(event: dict) -> bool:
+    """True si el invoke viene de tool de infra confiable, bypassea
+    el rate limit por fingerprint (la cuota es para usuarios publicos,
+    no para healthchecks internos).
+
+    Defensa en profundidad — AMBAS condiciones requeridas en AND:
+      1. Marker top-level ``_infrastructure_invoke=True`` (intencion
+         explicita del caller — opt-in deliberado, no accidental).
+      2. AUSENCIA de ``requestContext`` (origen infalsificable: API
+         Gateway HTTP API payload v2.0 SIEMPRE inyecta requestContext
+         server-side, imposible suprimirlo desde un cliente HTTP).
+
+    Por que las DOS:
+      - Marker solo seria un agujero si algun dia AWS cambia la spec
+        de HTTP API para forwardear top-level fields (no es el caso
+        en v2.0 actual, pero defense in depth).
+      - Sin requestContext solo es muy implicito — otro path de codigo
+        podria agregar invoke directo sin querer y disparar bypass
+        accidentalmente. El marker hace que sea opt-in.
+      - En AND: requestContext da el ORIGEN (lambda.invoke directo,
+        IAM-scoped); marker da la INTENCION (caller explicito).
+
+    Ver memoria 6.6.a / commit del bypass para threat model detallado.
+    """
+    if event.get(_INFRA_MARKER_KEY) is not True:
+        return False
+    return "requestContext" not in event
+
+
 def _check_and_increment_rate_limit(fingerprint: str) -> tuple[bool, dict]:
     """Rate limit atomico server-side por fingerprint via UpdateItem condicional.
 
@@ -1067,14 +1108,20 @@ def _handle_predict(event: dict) -> dict:
         })
 
     # --- Fase 2: rate limit ------------------------------------------------
-    rate_ok, rate_info = _check_and_increment_rate_limit(fingerprint)
-    if not rate_ok:
-        return _predict_response(
-            429,
-            {"error": f"Llegaste al limite diario ({rate_info['limit']} audios). "
-                      "Volvé mañana para clasificar mas."},
-            rate_info=rate_info,
-        )
+    # Infra invokes (smoke, healthcheck) bypassean rate limit. El check de
+    # _is_infra_invoke require AMBAS condiciones: marker top-level (intencion)
+    # AND ausencia de requestContext (origen). Ver _is_infra_invoke.
+    if _is_infra_invoke(event):
+        rate_info = None  # no rate_info para infra; consumers chequean Optional
+    else:
+        rate_ok, rate_info = _check_and_increment_rate_limit(fingerprint)
+        if not rate_ok:
+            return _predict_response(
+                429,
+                {"error": f"Llegaste al limite diario ({rate_info['limit']} audios). "
+                          "Volvé mañana para clasificar mas."},
+                rate_info=rate_info,
+            )
 
     # --- Fase 3: generar identificadores -----------------------------------
     prediction_id = str(uuid.uuid4())
