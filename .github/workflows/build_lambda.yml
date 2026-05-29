@@ -37,6 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ env.AWS_ROLE_ARN }}
@@ -44,6 +48,17 @@ jobs:
 
       - id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
+
+      # Lambda/models esta gitignored. Staging completo en S3
+      # (conocetuave-py-uploads/_infra/lambda_models/, rol ya tiene
+      # s3:GetObject). Update manual desde local cuando se promueve un
+      # modelo nuevo (classifier.onnx) o se rota BirdNET upstream.
+      - name: Populate lambda/models/ from S3
+        run: |
+          set -euo pipefail
+          mkdir -p lambda/models
+          aws s3 sync s3://conocetuave-py-uploads/_infra/lambda_models/ lambda/models/
+          ls -la lambda/models/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

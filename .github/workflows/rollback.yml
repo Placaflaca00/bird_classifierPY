@@ -326,8 +326,8 @@ jobs:
 
       # Step 5: smoke test post-rollback. RESULTADO = REPORTE en DDB, NO gate.
       #
-      # Distinguimos 3 estados del smoke (no solo passed/failed binario):
-      #   passed       — exit 0: smoke corrio y supero todos los thresholds
+      # Distinguimos 4 estados del smoke (no solo passed/failed binario):
+      #   passed       — exit 0: smoke corrio y supero todos los thresholds.
       #   failed       — exit 1: smoke corrio pero NO supero algun threshold
       #                  (latencia, top1_rate, confidence_violations).
       #                  Signal real de "el modelo deployado se comporta
@@ -336,6 +336,10 @@ jobs:
       #                  audios faltantes, error de AWS pre-invoke). NO
       #                  informa nada del modelo. Operador debe investigar
       #                  smoke en si mismo, no la imagen deployada.
+      #   rate_limited — exit 3: cuota del fingerprint smoke agotada (30/dia).
+      #                  Lambda devolvio 429. NO informa nada del modelo.
+      #                  Pasa hasta que el rate-limit reset (00:00 UTC) o
+      #                  el bypass infra del paso 2b este deployado.
       #   error        — cualquier otro exit (set +e + capturado).
       #
       # En commit anterior usabamos un BOOL post_rollback_smoke_passed que
@@ -354,6 +358,7 @@ jobs:
             0) SMOKE_STATUS=passed ;;
             1) SMOKE_STATUS=failed ;;
             2) SMOKE_STATUS=config_error ;;
+            3) SMOKE_STATUS=rate_limited ;;
             *) SMOKE_STATUS=error ;;
           esac
           echo "Smoke exit=$SMOKE_EXIT status=$SMOKE_STATUS"
