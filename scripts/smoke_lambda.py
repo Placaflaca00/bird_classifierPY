@@ -110,7 +110,17 @@ def _invoke_lambda_with_audio(
         "top_k": 3,
         "training_consent": False,
     }
-    event = {"rawPath": "/predict", "body": json.dumps(body)}
+    # Marker para que handler._is_infra_invoke bypassee el rate limit
+    # del fingerprint. Defensa en profundidad: marker AND ausencia de
+    # requestContext (que no agregamos). Solo callers con IAM
+    # lambda:InvokeFunction sobre el ARN pueden setear este field — API
+    # Gateway HTTP API v2.0 no propaga top-level customs desde el publico.
+    # Ver handler._is_infra_invoke para el threat model completo.
+    event = {
+        "_infrastructure_invoke": True,
+        "rawPath": "/predict",
+        "body": json.dumps(body),
+    }
     t0 = time.time()
     resp = lambda_client.invoke(
         FunctionName=function_name,
