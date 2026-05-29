@@ -1,0 +1,84 @@
+# Workflow Fase 6.6.b — build + push de la imagen Lambda al ECR.
+#
+# Para uso ocasional cuando hay que pushear una imagen nueva SIN pasar
+# por el flujo completo de retrain.yml. Ejemplos:
+#   - Fix puntual del handler (como el bypass de rate-limit del paso 2b)
+#   - Deploy debug con logger temporal
+#   - Cualquier cambio que no involucra entrenar un modelo nuevo
+#
+# NO actualiza Lambda. Solo construye la imagen y la pushea con el tag
+# elegido. El deploy del tag a Lambda se hace despues via rollback.yml
+# (workflow_dispatch con image_uri = <repo>:<tag>).
+
+name: Build Lambda image (Fase 6.6.b)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag para la imagen (ej: smoke-bypass). NO usar fase4/fase5*: reservados.'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_ROLE_ARN: arn:aws:iam::863518416901:role/bird-retrain-ci-role
+  AWS_REGION: us-east-1
+  ECR_REPO: bird-classifier-py
+
+jobs:
+  build-and-push:
+    name: Build + push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - id: build
+        name: Build + push lambda image
+        run: |
+          set -euo pipefail
+          ECR_URI="${{ steps.ecr-login.outputs.registry }}/$ECR_REPO"
+          TAG="${{ inputs.tag }}"
+          FULL="${ECR_URI}:${TAG}"
+          echo "Building ${FULL}..."
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --tag "${FULL}" \
+            --push \
+            lambda/
+          DIGEST=$(aws ecr describe-images \
+            --repository-name "$ECR_REPO" \
+            --image-ids imageTag="${TAG}" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          IMAGE_URI_DIGEST="${ECR_URI}@${DIGEST}"
+          echo "Pushed ${FULL}"
+          echo "Digest:    ${DIGEST}"
+          echo "Image URI: ${IMAGE_URI_DIGEST}"
+          echo "image_uri=${IMAGE_URI_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          echo "### Build OK" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Tag: \`${{ inputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Digest: \`${{ steps.build.outputs.image_digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image URI: \`${{ steps.build.outputs.image_uri }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Next**: dispatch \`rollback.yml\` con ese \`image_uri\`." >> "$GITHUB_STEP_SUMMARY"
