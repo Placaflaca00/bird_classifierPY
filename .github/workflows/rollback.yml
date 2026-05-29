@@ -325,8 +325,22 @@ jobs:
           echo "OK Lambda esta corriendo la imagen target ($TARGET_DIGEST)"
 
       # Step 5: smoke test post-rollback. RESULTADO = REPORTE en DDB, NO gate.
-      # exit code del CLI smoke (0 PASS / 1 FAIL / 2 config) NO bloquea
-      # el workflow — capturamos en variable y persistimos.
+      #
+      # Distinguimos 3 estados del smoke (no solo passed/failed binario):
+      #   passed       — exit 0: smoke corrio y supero todos los thresholds
+      #   failed       — exit 1: smoke corrio pero NO supero algun threshold
+      #                  (latencia, top1_rate, confidence_violations).
+      #                  Signal real de "el modelo deployado se comporta
+      #                  distinto al baseline".
+      #   config_error — exit 2: smoke NO pudo correr (baseline missing,
+      #                  audios faltantes, error de AWS pre-invoke). NO
+      #                  informa nada del modelo. Operador debe investigar
+      #                  smoke en si mismo, no la imagen deployada.
+      #   error        — cualquier otro exit (set +e + capturado).
+      #
+      # En commit anterior usabamos un BOOL post_rollback_smoke_passed que
+      # confundia "no pudo correr" con "fallo" (audios no existian en CI,
+      # exit 2 -> false, igual que un fail real). Ver memoria 6.6.a.
       - id: smoke
         name: Run smoke_lambda.py post-rollback (reporte)
         run: |
@@ -336,13 +350,14 @@ jobs:
             --function-name "$LAMBDA_FUNCTION_NAME"
           SMOKE_EXIT=$?
           set -e
-          if [ "$SMOKE_EXIT" -eq 0 ]; then
-            SMOKE_PASSED=true
-          else
-            SMOKE_PASSED=false
-          fi
-          echo "Smoke exit=$SMOKE_EXIT passed=$SMOKE_PASSED"
-          echo "smoke_passed=$SMOKE_PASSED" >> "$GITHUB_OUTPUT"
+          case "$SMOKE_EXIT" in
+            0) SMOKE_STATUS=passed ;;
+            1) SMOKE_STATUS=failed ;;
+            2) SMOKE_STATUS=config_error ;;
+            *) SMOKE_STATUS=error ;;
+          esac
+          echo "Smoke exit=$SMOKE_EXIT status=$SMOKE_STATUS"
+          echo "smoke_status=$SMOKE_STATUS" >> "$GITHUB_OUTPUT"
           echo "smoke_exit=$SMOKE_EXIT" >> "$GITHUB_OUTPUT"
 
       # Step 6: notify success — escribimos al item DDB el resultado completo.
@@ -350,13 +365,15 @@ jobs:
       - name: Notify rollback completed (con reporte smoke)
         env:
           PREV_URI: ${{ steps.capture-prev.outputs.previous_image_uri }}
-          SMOKE_PASSED: ${{ steps.smoke.outputs.smoke_passed }}
+          SMOKE_STATUS: ${{ steps.smoke.outputs.smoke_status }}
+          SMOKE_EXIT: ${{ steps.smoke.outputs.smoke_exit }}
         run: |
           python scripts/notify_training_run.py \
             --run-id "$RUN_ID" --action update --current-job rollback \
             --field "ecr_image_uri=$TARGET_IMAGE_URI" \
             --field "previous_image_uri=$PREV_URI" \
-            --field "post_rollback_smoke_passed=$SMOKE_PASSED"
+            --field "post_rollback_smoke_status=$SMOKE_STATUS" \
+            --field "post_rollback_smoke_exit=$SMOKE_EXIT"
 
   # ---------------------------------------------------------------------------
   # Job 3 — finalize: status sticky. Corre siempre (if: always()).

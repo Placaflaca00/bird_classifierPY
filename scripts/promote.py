@@ -549,10 +549,17 @@ def rollback_lambda(lambda_client, prev_image_uri: str) -> None:
 def _select_baseline_audios() -> list[Path]:
     """Selecciona 1 audio fijo por cada especie del baseline. Toma el primer
     archivo alfabeticamente para determinismo.
+
+    Path: scripts/smoke_audios/<species>/ (tracked en git, ~3MB total).
+    Movido desde data/raw/ en commit 6.6.a paso post-validacion. Razon:
+    data/raw/ esta gitignored -> CI runner no tiene los audios -> el
+    workflow rollback.yml tiraba 'baseline audio missing' (config_error,
+    exit 2 de smoke_lambda.py), generando smoke_passed=false vacuous en
+    DDB que no diferenciaba "smoke no pudo correr" de "smoke fallo".
     """
     selected: list[Path] = []
     for species_dir in SMOKE_BASELINE_AUDIOS:
-        d = ROOT / "data" / "raw" / species_dir
+        d = ROOT / "scripts" / "smoke_audios" / species_dir
         if not d.exists():
             raise FileNotFoundError(f"baseline audio dir missing: {d}")
         files = sorted(d.glob("*.mp3"))
