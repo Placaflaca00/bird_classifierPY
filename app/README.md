@@ -25,7 +25,6 @@ Pipeline en dos etapas:
    las 20 especies en scope.
 
 El frontend Gradio hace POST a una Lambda en AWS (codigo en el repo de GitHub).
-La primera consulta puede tardar ~30 s por cold start del backend.
 
 ## 20 especies en scope
 

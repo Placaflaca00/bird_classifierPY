@@ -939,12 +939,6 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
     with gr.Tabs():
         # ----- Tab 1: Clasificar -----
         with gr.Tab("Clasificar"):
-            gr.HTML(
-                '<p class="cold-note">La primera consulta puede tardar ~30 s '
-                "mientras el servidor despierta. Las siguientes son casi "
-                "instantaneas.</p>"
-            )
-
             with gr.Column(elem_classes="audio-block"):
                 audio_in = gr.Audio(
                     type="filepath",
