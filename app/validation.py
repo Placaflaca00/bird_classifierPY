@@ -189,6 +189,16 @@ def validate_audio(path: str | Path) -> ValidationResult:
     except (TypeError, ValueError, AttributeError) as e:
         return _fail("unreadable", reason=f"missing_metadata: {e!s}")
 
+    # OggOpus NO expone sample_rate: Opus siempre opera a 48 kHz (decodifica a
+    # 48k sin importar el rate de captura), asi que mutagen.OggOpusInfo omite
+    # el atributo y getattr devuelve 0 — lo que el check de sample rate de
+    # abajo marcaria como "unreadable". Las notas de voz de WhatsApp son
+    # Ogg/Opus: sin este branch, TODO audio de WhatsApp se rechaza en el
+    # frontend aunque el backend (libsndfile 1.2.2) lo decodifica bien.
+    # Verificado 2026-06-02.
+    if fmt_class == "OggOpus" and sample_rate_hz == 0:
+        sample_rate_hz = 48_000
+
     # 4: duration.
     if duration_s < MIN_DURATION_S:
         return _fail("too_short", duration_s=duration_s)

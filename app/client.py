@@ -80,6 +80,14 @@ _load_dotenv()
 API_URL_ENV = "API_GATEWAY_URL"
 DEFAULT_TOP_K = 3
 
+# Alias de extension -> contenedor que el backend whitelista. WhatsApp baja las
+# notas de voz como ``.opus`` (Ogg/Opus); el backend solo acepta mp3/wav/ogg/
+# flac, pero libsndfile decodifica opus-in-ogg igual que vorbis-in-ogg, asi que
+# normalizamos al contenedor real (audio/ogg). Sin esto el /upload-url devuelve
+# 400 "extension no soportada" para todo audio de WhatsApp. ``.oga`` es el otro
+# nombre estandar del contenedor Ogg-audio.
+_EXT_ALIASES = {"opus": "ogg", "oga": "ogg"}
+
 # (connect, read) en segundos. El read es alto a propósito: el cap de
 # integración del HTTP API es 30 s, así que esperar más del lado cliente solo
 # acumula latencia sin servir — si la API GW no respondió en 30 s, ya cerró
@@ -594,6 +602,9 @@ def predict(
             audio_path = Path(audio)
             audio_bytes = audio_path.read_bytes()
             ext = audio_path.suffix.lstrip(".").lower() or "mp3"
+            # Normaliza .opus/.oga -> ogg (ver _EXT_ALIASES): el backend
+            # whitelista el contenedor, no el codec.
+            ext = _EXT_ALIASES.get(ext, ext)
         if not audio_bytes:
             return PredictResult(
                 ok=False, error_kind="bad_request",

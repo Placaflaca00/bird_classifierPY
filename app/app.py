@@ -39,6 +39,15 @@ APP_SUBTITLE = "Clasificador de aves de Paraguay"
 TOP_K = 3
 LOW_CONFIDENCE_THRESHOLD = 0.5
 
+# Caption estatica debajo del audio: gestiona la expectativa de formatos. El
+# selector de archivos del navegador a veces griser los .opus segun el SO, y
+# el usuario reporto confusion al subir notas de voz de WhatsApp (Ogg/Opus).
+# Mencionamos WhatsApp explicito porque es el caso de uso mas comun aca.
+FORMATS_HINT = (
+    "Formatos: mp3, wav, ogg, flac y notas de voz de WhatsApp (.opus). "
+    "Hasta 90 s."
+)
+
 HERE = Path(__file__).resolve().parent
 ASSETS_DIR = HERE / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
@@ -788,6 +797,13 @@ _CSS = (
     margin: 6px 0 2px 0;
     min-height: 1.3em;  /* reserva altura para que el layout no salte cuando esta vacio */
 }
+.formats-hint {
+    text-align: center;
+    color: {{TEXT_DIM}};
+    font-size: 0.8em;
+    margin: 4px 0 0 0;
+    opacity: 0.8;
+}
 .error-box {
     background: #5a3a3a !important;
     border: 1px solid #a06060 !important;
@@ -946,6 +962,9 @@ with gr.Blocks(theme=_build_theme(), title=APP_TITLE, css=_CSS) as demo:
                     label="Audio del ave",
                     show_label=True,
                 )
+                # Caption estatica de formatos aceptados (no es el hint dinamico
+                # de estado — ese es status_hint, debajo).
+                gr.Markdown(FORMATS_HINT, elem_classes="formats-hint")
                 # State machine UI: hint debajo del audio + boton que arranca
                 # disabled. Solo se habilita cuando hay audio cargado.
                 status_hint = gr.Markdown(

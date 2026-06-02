@@ -7,6 +7,8 @@ genera trivialmente sin binarios externos.
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import wave
 from pathlib import Path
@@ -153,6 +155,40 @@ def test_nonexistent_path(tmp_path: Path) -> None:
     result = validate_audio(tmp_path / "does_not_exist.wav")
     assert not result.ok
     assert result.error_code == "unreadable"
+
+
+# ---------------------------------------------------------------------------
+# Ogg/Opus (notas de voz de WhatsApp): regresion 2026-06-02
+# ---------------------------------------------------------------------------
+# WhatsApp graba en Ogg/Opus. mutagen.OggOpusInfo NO expone ``sample_rate``
+# (Opus siempre opera a 48 kHz), asi que el getattr daba 0 y la validacion
+# rechazaba TODO audio de WhatsApp como "unreadable". El fix asume 48000 para
+# OggOpus. Generamos el fixture con ffmpeg (workstation lo tiene via winget);
+# en CI sin ffmpeg el test se skipea en vez de fallar.
+def test_ogg_opus_whatsapp_voice_note(tmp_path: Path) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("ffmpeg no disponible (CI); fixture Ogg/Opus no generable")
+    opus_path = tmp_path / "voice_note.opus"
+    proc = subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "sine=frequency=2000:duration=2",
+            "-c:a", "libopus", "-b:a", "24k", str(opus_path), "-y",
+        ],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not opus_path.exists():
+        pytest.skip("ffmpeg sin encoder libopus; fixture no generable")
+
+    result = validate_audio(opus_path)
+    assert result.ok, (
+        f"Ogg/Opus rechazado: {result.error_code} {result.error_message}"
+    )
+    assert result.info is not None
+    assert result.info.format == "ogg"
+    # Opus siempre 48 kHz; el fix lo asume cuando mutagen omite el atributo.
+    assert result.info.sample_rate_hz == 48_000
 
 
 # ---------------------------------------------------------------------------
